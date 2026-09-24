@@ -46,7 +46,7 @@
   },
   "dependencies": {
     "@hookform/resolvers": "5.2.2",
-    "@huggingface/transformers": "4.1.0",
+    "@huggingface/transformers": "4.3.0",
     "@lottiefiles/dotlottie-web": "0.76.0",
     "@mediabunny/aac-encoder": "1.50.3",
     "@mediabunny/ac3": "1.50.3",
