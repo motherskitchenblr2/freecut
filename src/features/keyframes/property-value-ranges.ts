@@ -3,6 +3,7 @@ import { MAX_PACKED_RGB, MIN_PACKED_RGB } from '@/features/keyframes/utils/color
 import {
   isBuiltInAnimatableProperty,
   parseEffectAnimatableProperty,
+  parsePathVertexAnimatableProperty,
   type AnimatableProperty,
   type BuiltInAnimatableProperty,
 } from '@/types/keyframe'
@@ -31,7 +32,7 @@ const BUILT_IN_PROPERTY_VALUE_RANGES: Record<BuiltInAnimatableProperty, Property
   cropBottom: { property: 'cropBottom', min: 0, max: 4000, unit: 'px', decimals: 0 },
   cropSoftness: { property: 'cropSoftness', min: -2000, max: 2000, unit: 'px', decimals: 0 },
   volume: { property: 'volume', min: -60, max: 20, unit: 'dB', decimals: 1 },
-  textStyleScale: { property: 'textStyleScale', min: 0.5, max: 3, unit: 'x', decimals: 2 },
+  textStyleScale: { property: 'textStyleScale', min: 0.5, max: 6, unit: 'x', decimals: 2 },
   fontSize: { property: 'fontSize', min: 8, max: 500, unit: 'px', decimals: 0 },
   lineHeight: { property: 'lineHeight', min: 0.5, max: 3, unit: 'x', decimals: 2 },
   textPadding: { property: 'textPadding', min: 0, max: 160, unit: 'px', decimals: 0 },
@@ -50,8 +51,15 @@ const BUILT_IN_PROPERTY_VALUE_RANGES: Record<BuiltInAnimatableProperty, Property
     unit: 'px',
     decimals: 0,
   },
-  textShadowBlur: { property: 'textShadowBlur', min: 0, max: 80, unit: 'px', decimals: 0 },
+  textShadowBlur: { property: 'textShadowBlur', min: 0, max: 160, unit: 'px', decimals: 0 },
   strokeWidth: { property: 'strokeWidth', min: 0, max: 24, unit: 'px', decimals: 0 },
+  trimPathStart: { property: 'trimPathStart', min: 0, max: 100, unit: '%', decimals: 1 },
+  trimPathEnd: { property: 'trimPathEnd', min: 0, max: 100, unit: '%', decimals: 1 },
+  trimPathOffset: { property: 'trimPathOffset', min: -360, max: 360, unit: '°', decimals: 1 },
+  taperStartWidth: { property: 'taperStartWidth', min: 0, max: 200, unit: '%', decimals: 1 },
+  taperEndWidth: { property: 'taperEndWidth', min: 0, max: 200, unit: '%', decimals: 1 },
+  taperStartLength: { property: 'taperStartLength', min: 0, max: 100, unit: '%', decimals: 1 },
+  taperEndLength: { property: 'taperEndLength', min: 0, max: 100, unit: '%', decimals: 1 },
 }
 
 function getDecimalsFromStep(step: number | undefined): number {
@@ -70,15 +78,27 @@ function inferUnit(label: string): string {
   return ''
 }
 
-function getPropertyValueRange(property: AnimatableProperty): PropertyValueRange | null {
-  if (isBuiltInAnimatableProperty(property)) {
-    return BUILT_IN_PROPERTY_VALUE_RANGES[property]
+function getPathPropertyValueRange(
+  property: AnimatableProperty,
+): PropertyValueRange | null {
+  const pathVertex = parsePathVertexAnimatableProperty(property)
+  if (!pathVertex) return null
+  const isPosition =
+    pathVertex.component === 'positionX' || pathVertex.component === 'positionY'
+  return {
+    property,
+    min: isPosition ? 0 : -2,
+    max: isPosition ? 1 : 2,
+    unit: '',
+    decimals: 3,
   }
+}
 
+function getEffectPropertyValueRange(
+  property: AnimatableProperty,
+): PropertyValueRange | null {
   const parsed = parseEffectAnimatableProperty(property)
-  if (!parsed) {
-    return null
-  }
+  if (!parsed) return null
 
   const definition = getGpuEffect(parsed.gpuEffectType)
   const param = definition?.params[parsed.paramKey]
@@ -107,6 +127,13 @@ function getPropertyValueRange(property: AnimatableProperty): PropertyValueRange
     unit: inferUnit(param.label),
     decimals: getDecimalsFromStep(param.step),
   }
+}
+
+function getPropertyValueRange(property: AnimatableProperty): PropertyValueRange | null {
+  if (isBuiltInAnimatableProperty(property)) {
+    return BUILT_IN_PROPERTY_VALUE_RANGES[property]
+  }
+  return getPathPropertyValueRange(property) ?? getEffectPropertyValueRange(property)
 }
 
 export const PROPERTY_VALUE_RANGES = new Proxy<Record<string, PropertyValueRange>>(

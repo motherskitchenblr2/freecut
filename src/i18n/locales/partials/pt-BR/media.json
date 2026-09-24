@@ -52,6 +52,7 @@
       }
     },
     "compositions": {
+      "compositionsGroup": "Composições",
       "compoundClipsGroup": "Clipes compostos",
       "deleteBody": "Excluir o clipe composto “{{name}}”? Esta ação não pode ser desfeita.",
       "deleteInstancesDetail": "{{count}} instâncias da linha do tempo que usam este clipe composto também serão removidas.",
@@ -276,12 +277,15 @@
       "language": "Idioma",
       "model": "Modelo",
       "noLanguages": "Nenhum idioma",
+      "parakeetAutoDetects": "Detecta automaticamente {{count}} idiomas europeus.",
+      "parakeetChooseWhisper": "Para chinês, japonês, coreano e outros idiomas, escolha um modelo Whisper.",
       "progressAria": "Progresso",
       "quantization": "Quantizacao",
       "refreshTitle": "Atualizar transcrição",
       "searchLanguages": "Pesquisar idiomas",
       "start": "Iniciar",
-      "stop": "Parar"
+      "stop": "Parar",
+      "whisperLanguageHint": "Escolha o idioma falado para melhorar a precisão ou use a detecção automática."
     },
     "type": {
       "audio": "Audio",

@@ -258,6 +258,7 @@
       "heroSubtitle": "전문가용 동영상 편집, 설치 불필요. 브라우저에서 멋진 콘텐츠를 만드세요.",
       "disclaimer": "⚠️ 면책 조항: 아직 베타 단계라 버그가 있을 수 있습니다. 그래도 즐겁게 사용하시길 바랍니다.",
       "getStarted": "시작하기",
+      "viewChangelog": "새로운 기능",
       "starOnGitHub": "GitHub에서 별 누르기",
       "showcaseHeading": "다양한 기능을 갖춘 편집 기능",
       "showcaseSubheading": "완전한 동영상 편집 도구 모음을 브라우저에서.",
@@ -277,17 +278,33 @@
           "title": "타임라인 편집",
           "description": "동영상, 오디오, 텍스트, 도형을 사용한 멀티트랙 편집"
         },
-        "keyframe": {
-          "title": "간단한 키프레임 편집기",
-          "description": "부드러운 전환을 위한 직관적인 키프레임 애니메이션"
+        "motion": {
+          "title": "모션 작업 공간",
+          "description": "정밀한 타이밍과 재사용 가능한 이징으로 레이어 애니메이션을 만드세요"
         },
-        "projects": {
-          "title": "프로젝트 관리",
-          "description": "프로젝트를 만들고 정리하고 관리하세요"
+        "colorGrade": {
+          "title": "색상 그레이딩",
+          "description": "컬러 휠, 커브, 스코프, 조정 레이어로 색상을 보정하세요"
+        },
+        "keyframe": {
+          "title": "키프레임 편집기",
+          "description": "그래프 또는 도프시트 보기에서 움직임을 정밀하게 조정하세요"
+        },
+        "semantic": {
+          "title": "시맨틱 장면 검색",
+          "description": "화면에서 일어나는 일을 검색해 원하는 순간을 찾으세요"
         },
         "export": {
           "title": "웹에서 내보내기",
           "description": "브라우저로 동영상을 로컬에서 렌더링하세요."
+        },
+        "audioEq": {
+          "title": "오디오 EQ 및 믹싱",
+          "description": "시각적 이퀄라이저로 클립과 트랙 오디오를 조정하세요"
+        },
+        "hotkeys": {
+          "title": "사용자 지정 키보드 단축키",
+          "description": "편집 단축키를 확인하고 변경하거나 가져오고 내보내세요"
         }
       },
       "faq": {
@@ -473,6 +490,12 @@
           "clearKeyframes": "선택한 항목의 모든 키프레임 지우기",
           "keyframeEditorGraph": "키프레임 편집기를 그래프 보기로 전환",
           "keyframeEditorDopesheet": "키프레임 편집기를 도프시트 보기로 전환",
+          "keyframeEditorSplit": "키프레임 편집기를 분할 보기로 전환",
+          "editKeyframeAdd": "선택한 편집 레이어의 재생 헤드에 키프레임 추가",
+          "keyframePrevious": "이전 속성 키프레임으로 이동",
+          "keyframeNext": "다음 속성 키프레임으로 이동",
+          "keyframeToggleAuto": "활성 속성의 자동 키 전환",
+          "keyframeFit": "선택한 키프레임을 보기에 맞춤",
           "markIn": "인 지점 표시",
           "markOut": "아웃 지점 표시",
           "clearInOut": "인/아웃 지점 지우기",
@@ -535,6 +558,13 @@
     "routeError": {
       "title": "문제가 발생했습니다",
       "description": "FreeCut이 이 페이지를 모두 불러오지 못했습니다.",
+      "projectNotFoundTitle": "이 프로젝트를 찾을 수 없습니다",
+      "projectNotFoundDescription": "프로젝트가 이동 또는 삭제되었거나 오래된 링크에서 열렸을 수 있습니다. 다른 프로젝트는 작업 공간에서 계속 사용할 수 있습니다.",
+      "backToProjects": "프로젝트로 돌아가기",
+      "supportHint": "도움이 필요하면 오류 세부 정보를 복사하여 개발자에게 보내세요.",
+      "copyDetails": "오류 세부 정보 복사",
+      "detailsCopied": "오류 세부 정보를 복사했습니다",
+      "copyFailed": "세부 정보를 복사하지 못했습니다",
       "causePermission": "FreeCut에 작업 폴더를 사용할 권한이 더 이상 없습니다. 다시 연결하거나 다른 폴더를 선택하세요.",
       "causeMissing": "작업 폴더를 찾을 수 없습니다. 이동되었거나 이름이 변경되었거나 삭제되었을 수 있습니다.",
       "causeUnsupported": "작업 폴더가 FreeCut에 필요한 기능을 모두 지원하지 않는 드라이브에 있습니다. 클라우드 동기화 폴더나 네트워크 폴더에서 흔히 발생합니다. 로컬 디스크의 폴더를 선택하면 대부분 해결됩니다."

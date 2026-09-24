@@ -258,6 +258,7 @@
       "heroSubtitle": "プロ仕様の動画編集を、インストール不要で。ブラウザで魅力的なコンテンツを作りましょう。",
       "disclaimer": "⚠️ 免責事項: これはまだベータ段階で、不具合がある場合があります。それでも楽しんでいただければ幸いです。",
       "getStarted": "はじめる",
+      "viewChangelog": "新機能",
       "starOnGitHub": "GitHubでスターを付ける",
       "showcaseHeading": "多機能な編集機能",
       "showcaseSubheading": "完全な動画編集スイートを、ブラウザの中で。",
@@ -277,17 +278,33 @@
           "title": "タイムライン編集",
           "description": "動画、音声、テキスト、図形によるマルチトラック編集"
         },
-        "keyframe": {
-          "title": "シンプルなキーフレームエディター",
-          "description": "なめらかなトランジションのための直感的なキーフレームアニメーション"
+        "motion": {
+          "title": "モーションワークスペース",
+          "description": "正確なタイミングと再利用可能なイージングでレイヤーアニメーションを作成"
         },
-        "projects": {
-          "title": "プロジェクト管理",
-          "description": "プロジェクトの作成、整理、管理"
+        "colorGrade": {
+          "title": "カラーグレーディング",
+          "description": "カラーホイール、カーブ、スコープ、調整レイヤーで色を調整"
+        },
+        "keyframe": {
+          "title": "キーフレームエディター",
+          "description": "グラフまたはドープシート表示で動きを細かく調整"
+        },
+        "semantic": {
+          "title": "セマンティックシーン検索",
+          "description": "画面の内容を検索して目的の瞬間を発見"
         },
         "export": {
           "title": "ウェブでエクスポート",
           "description": "ブラウザで動画をローカルにレンダリングします。"
+        },
+        "audioEq": {
+          "title": "オーディオEQとミキシング",
+          "description": "ビジュアルEQでクリップとトラックの音を調整"
+        },
+        "hotkeys": {
+          "title": "カスタムキーボードショートカット",
+          "description": "編集ショートカットの確認、変更、読み込み、書き出し"
         }
       },
       "faq": {
@@ -473,6 +490,12 @@
           "clearKeyframes": "選択した項目のすべてのキーフレームをクリア",
           "keyframeEditorGraph": "キーフレームエディターをグラフビューに切り替え",
           "keyframeEditorDopesheet": "キーフレームエディターをドープシートビューに切り替え",
+          "keyframeEditorSplit": "キーフレームエディターを分割ビューに切り替え",
+          "editKeyframeAdd": "選択した編集レイヤーの再生ヘッド位置にキーフレームを追加",
+          "keyframePrevious": "前のプロパティキーフレームへ移動",
+          "keyframeNext": "次のプロパティキーフレームへ移動",
+          "keyframeToggleAuto": "アクティブなプロパティの自動キーを切り替え",
+          "keyframeFit": "選択したキーフレームをビューに合わせる",
           "markIn": "イン点をマーク",
           "markOut": "アウト点をマーク",
           "clearInOut": "イン/アウト点をクリア",
@@ -535,6 +558,13 @@
     "routeError": {
       "title": "問題が発生しました",
       "description": "FreeCut はこのページの読み込みを完了できませんでした。",
+      "projectNotFoundTitle": "このプロジェクトが見つかりません",
+      "projectNotFoundDescription": "移動または削除されたか、古いリンクから開かれた可能性があります。他のプロジェクトは引き続きワークスペースで利用できます。",
+      "backToProjects": "プロジェクト一覧に戻る",
+      "supportHint": "サポートが必要な場合は、エラーの詳細をコピーして開発者に送ってください。",
+      "copyDetails": "エラーの詳細をコピー",
+      "detailsCopied": "エラーの詳細をコピーしました",
+      "copyFailed": "詳細をコピーできませんでした",
       "causePermission": "FreeCut はワークスペースフォルダーを使用する権限を失いました。再接続するか、別のフォルダーを選択してください。",
       "causeMissing": "ワークスペースフォルダーが見つかりません。移動、名前の変更、または削除された可能性があります。",
       "causeUnsupported": "ワークスペースフォルダーは、FreeCut に必要な機能をすべてサポートしていないドライブ上にあります。クラウド同期フォルダーやネットワークフォルダーではよくあることです。ローカルディスク上のフォルダーを選ぶと、たいていは解決します。"

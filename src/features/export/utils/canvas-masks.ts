@@ -5,7 +5,7 @@
  * Supports shape masks with feathering and inversion.
  */
 
-import type { ShapeItem, TimelineTrack } from '@/types/timeline'
+import type { ShapeItem, TimelineItem, TimelineTrack } from '@/types/timeline'
 import type { ItemKeyframes } from '@/types/keyframe'
 import type { ResolvedTransform } from '@/types/transform'
 import {
@@ -17,6 +17,11 @@ import {
   rotatePath,
   resolveActiveShapeMasksAtFrame,
 } from '@/features/export/deps/composition-runtime'
+import {
+  getLogicalCanvasSize,
+  scaleResolvedTransformForCanvas,
+  scaleShapeItemForCanvas,
+} from './canvas-render-scale'
 
 interface MaskEntry {
   mask: ShapeItem
@@ -30,6 +35,8 @@ export interface PreparedMask {
   bitmapMask?: OffscreenCanvas
   inverted: boolean
   feather: number
+  /** Normalized matte strength (0-1). */
+  opacity: number
   maskType: 'clip' | 'alpha'
   trackOrder: number
 }
@@ -44,6 +51,8 @@ export interface MaskFrameIndex {
 export interface MaskCanvasSettings {
   width: number
   height: number
+  logicalWidth?: number
+  logicalHeight?: number
   fps: number
 }
 
@@ -63,6 +72,20 @@ function resolveMaskKeyframes(
  */
 export function svgPathToPath2D(svgPath: string): Path2D {
   return new Path2D(svgPath)
+}
+
+function paintMaskPath(
+  ctx: OffscreenCanvasRenderingContext2D,
+  path: Path2D,
+  mask: ShapeItem,
+): void {
+  ctx.fillStyle = 'white'
+  ctx.fill(path)
+  const strokeWidth = mask.strokeWidth ?? 0
+  if (strokeWidth <= 0) return
+  ctx.strokeStyle = 'white'
+  ctx.lineWidth = strokeWidth
+  ctx.stroke(path)
 }
 
 /**
@@ -96,7 +119,7 @@ function renderCornerPinnedMaskBitmap(
   }
 
   const localPath = getShapePath(
-    mask,
+    { ...mask, pathClosed: true },
     {
       x: 0,
       y: 0,
@@ -111,13 +134,11 @@ function renderCornerPinnedMaskBitmap(
     },
   )
   const localPath2d = svgPathToPath2D(localPath)
-  localCtx.fillStyle = 'white'
-  localCtx.fill(localPath2d)
-  if ((mask.strokeWidth ?? 0) > 0) {
-    localCtx.strokeStyle = 'white'
-    localCtx.lineWidth = mask.strokeWidth ?? 0
-    localCtx.stroke(localPath2d)
-  }
+  const opacity =
+    (Math.max(0, Math.min(100, mask.maskOpacity ?? 100)) / 100) *
+    Math.max(0, Math.min(1, transform.opacity))
+  localCtx.globalAlpha = opacity
+  paintMaskPath(localCtx, localPath2d, mask)
 
   const outputCanvas = new OffscreenCanvas(canvas.width, canvas.height)
   const outputCtx = outputCanvas.getContext('2d')
@@ -147,15 +168,18 @@ export function buildPreparedMask(
   transform: ResolvedTransform,
   canvas: MaskCanvasSettings,
 ): PreparedMask {
-  const cornerPinnedBitmapMask = renderCornerPinnedMaskBitmap(mask, transform, canvas)
+  const renderedMask = scaleShapeItemForCanvas(mask, canvas)
+  const cornerPinnedBitmapMask = renderCornerPinnedMaskBitmap(renderedMask, transform, canvas)
   if (cornerPinnedBitmapMask) {
-    const maskType = mask.maskType ?? 'clip'
-    const feather = maskType === 'alpha' ? (mask.maskFeather ?? 0) : 0
+    const maskType = renderedMask.maskType ?? 'clip'
+    const feather = maskType === 'alpha' ? (renderedMask.maskFeather ?? 0) : 0
 
     return {
       bitmapMask: cornerPinnedBitmapMask,
-      inverted: mask.maskInvert ?? false,
+      inverted: renderedMask.maskInvert ?? false,
       feather,
+      // The corner-pinned bitmap already carries the opacity in its alpha.
+      opacity: 1,
       maskType,
       trackOrder: 0,
     }
@@ -163,7 +187,7 @@ export function buildPreparedMask(
 
   // Generate SVG path
   let svgPath = getShapePath(
-    mask,
+    { ...renderedMask, pathClosed: true },
     {
       x: transform.x,
       y: transform.y,
@@ -185,14 +209,18 @@ export function buildPreparedMask(
     svgPath = rotatePath(svgPath, transform.rotation, centerX, centerY)
   }
 
-  const maskType = mask.maskType ?? 'clip'
+  const maskType = renderedMask.maskType ?? 'clip'
   // Feather only applies to alpha masks - clip masks are always hard-edged
-  const feather = maskType === 'alpha' ? (mask.maskFeather ?? 0) : 0
+  const feather = maskType === 'alpha' ? (renderedMask.maskFeather ?? 0) : 0
+  const opacity =
+    (Math.max(0, Math.min(100, renderedMask.maskOpacity ?? 100)) / 100) *
+    Math.max(0, Math.min(1, transform.opacity))
 
   return {
     path: svgPathToPath2D(svgPath),
-    inverted: mask.maskInvert ?? false,
+    inverted: renderedMask.maskInvert ?? false,
     feather,
+    opacity,
     maskType,
     trackOrder: 0,
   }
@@ -273,6 +301,7 @@ function applyAlphaMask(
   path: Path2D,
   inverted: boolean,
   feather: number,
+  opacity: number,
   canvas: MaskCanvasSettings,
 ): void {
   // Create mask canvas with ALPHA-based masking
@@ -310,7 +339,9 @@ function applyAlphaMask(
   // destination-in: keeps destination (content) only where source (mask) alpha > 0
   ctx.drawImage(contentCanvas, 0, 0)
   ctx.globalCompositeOperation = 'destination-in'
+  ctx.globalAlpha = opacity
   ctx.drawImage(finalMask, 0, 0)
+  ctx.globalAlpha = 1
   ctx.globalCompositeOperation = 'source-over'
 }
 
@@ -320,6 +351,7 @@ function applyBitmapMask(
   bitmapMask: OffscreenCanvas,
   inverted: boolean,
   feather: number,
+  opacity: number,
   canvas: MaskCanvasSettings,
 ): void {
   let finalMask = bitmapMask
@@ -351,7 +383,9 @@ function applyBitmapMask(
 
   ctx.drawImage(contentCanvas, 0, 0)
   ctx.globalCompositeOperation = 'destination-in'
+  ctx.globalAlpha = opacity
   ctx.drawImage(finalMask, 0, 0)
+  ctx.globalAlpha = 1
   ctx.globalCompositeOperation = 'source-over'
 }
 
@@ -373,6 +407,7 @@ export function applyMasks(
     inverted: boolean
     feather: number
     maskType: 'clip' | 'alpha'
+    opacity: number
     trackOrder?: number
   }>,
   canvas: MaskCanvasSettings,
@@ -384,7 +419,9 @@ export function applyMasks(
   }
 
   // Check if we have any alpha masks (need special handling)
-  const hasAlphaMasks = masks.some((m) => m.bitmapMask || m.maskType === 'alpha' || m.feather > 0)
+  const hasAlphaMasks = masks.some(
+    (m) => m.bitmapMask || m.maskType === 'alpha' || m.feather > 0 || m.opacity < 1,
+  )
 
   if (!hasAlphaMasks) {
     // All clip masks - can use simple clipping with Path2D.clip()
@@ -415,9 +452,10 @@ export function applyMasks(
         mask.bitmapMask,
         mask.inverted,
         mask.feather,
+        mask.opacity,
         canvas,
       )
-    } else if (mask.maskType === 'clip' && mask.feather === 0 && mask.path) {
+    } else if (mask.maskType === 'clip' && mask.feather === 0 && mask.opacity === 1 && mask.path) {
       // Simple clip mask
       outputCtx.save()
       applyClipMask(outputCtx, mask.path, mask.inverted, canvas)
@@ -425,7 +463,15 @@ export function applyMasks(
       outputCtx.restore()
     } else if (mask.path) {
       // Alpha mask with optional feathering
-      applyAlphaMask(outputCtx, currentContent, mask.path, mask.inverted, mask.feather, canvas)
+      applyAlphaMask(
+        outputCtx,
+        currentContent,
+        mask.path,
+        mask.inverted,
+        mask.feather,
+        mask.opacity,
+        canvas,
+      )
     }
 
     currentContent = outputCanvas
@@ -469,12 +515,14 @@ export function getActiveMasksForFrame(
   getPreviewTransformOverride?: (itemId: string) => Partial<ResolvedTransform> | undefined,
   getPreviewPathVerticesOverride?: PreviewPathVerticesOverride,
   getLiveItem?: (itemId: string) => ShapeItem | undefined,
+  getExpressionItem?: (itemId: string) => TimelineItem | undefined,
 ): Array<{
   path?: Path2D
   bitmapMask?: OffscreenCanvas
   inverted: boolean
   feather: number
   maskType: 'clip' | 'alpha'
+  opacity: number
   trackOrder: number
 }> {
   const activeMasks: Array<{
@@ -483,6 +531,7 @@ export function getActiveMasksForFrame(
     inverted: boolean
     feather: number
     maskType: 'clip' | 'alpha'
+    opacity: number
     trackOrder: number
   }> = []
   const liveMasks = index.masks.map(({ mask, trackOrder }) => ({
@@ -490,16 +539,21 @@ export function getActiveMasksForFrame(
     trackOrder,
   }))
   const activeMaskShapes = resolveActiveShapeMasksAtFrame(liveMasks, {
-    canvas,
+    canvas: getLogicalCanvasSize(canvas),
     frame,
     getKeyframes: (itemId) => resolveMaskKeyframes(keyframes, itemId),
+    getItem: getExpressionItem,
     getPreviewTransform: getPreviewTransformOverride,
     getPreviewPathVertices: getPreviewPathVerticesOverride,
   })
 
   for (const mask of activeMaskShapes) {
     activeMasks.push({
-      ...buildPreparedMask(mask.shape, mask.transform, canvas),
+      ...buildPreparedMask(
+        mask.shape,
+        scaleResolvedTransformForCanvas(mask.transform, canvas),
+        canvas,
+      ),
       trackOrder: mask.trackOrder,
     })
   }

@@ -6,6 +6,7 @@ import {
   getLeftEditorSidebarBounds,
 } from '@/config/editor-layout'
 import { useSettingsStore } from '@/features/editor/deps/settings'
+import { usePlaybackStore } from '@/shared/state/playback'
 
 describe('editor-store', () => {
   beforeEach(() => {
@@ -28,7 +29,6 @@ describe('editor-store', () => {
       workspace: 'edit',
       leftSidebarOpen: true,
       rightSidebarOpen: true,
-      keyframeEditorOpen: false,
       keyframeEditorShortcutScopeActive: false,
       activeTab: 'media',
       clipInspectorTab: 'video',
@@ -49,6 +49,7 @@ describe('editor-store', () => {
       propertiesFullColumn: false,
       mediaFullColumn: true,
     })
+    usePlaybackStore.setState({ isPlaying: false, previewFrame: null, previewItemId: null })
   })
 
   it('sets active panel', () => {
@@ -77,19 +78,6 @@ describe('editor-store', () => {
 
     useEditorStore.getState().toggleRightSidebar()
     expect(useEditorStore.getState().rightSidebarOpen).toBe(true)
-  })
-
-  it('opens the keyframe editor and reveals the left sidebar', () => {
-    useEditorStore.getState().setLeftSidebarOpen(false)
-    expect(useEditorStore.getState().keyframeEditorOpen).toBe(false)
-
-    useEditorStore.getState().toggleKeyframeEditorOpen()
-
-    expect(useEditorStore.getState().keyframeEditorOpen).toBe(true)
-    expect(useEditorStore.getState().leftSidebarOpen).toBe(true)
-
-    useEditorStore.getState().setKeyframeEditorOpen(false)
-    expect(useEditorStore.getState().keyframeEditorOpen).toBe(false)
   })
 
   it('sets active tab', () => {
@@ -249,6 +237,16 @@ describe('editor-store', () => {
     const currentState = useEditorStore.getState()
     useEditorStore.getState().setWorkspace('edit')
     expect(useEditorStore.getState()).toBe(currentState)
+  })
+
+  it('stops transient preview playback before switching workspaces', () => {
+    usePlaybackStore.setState({ isPlaying: true, previewFrame: 42, previewItemId: 'clip-1' })
+
+    useEditorStore.getState().setWorkspace('color')
+
+    expect(usePlaybackStore.getState().isPlaying).toBe(false)
+    expect(usePlaybackStore.getState().previewFrame).toBeNull()
+    expect(usePlaybackStore.getState().previewItemId).toBeNull()
   })
 
   it('toggles linked selection', () => {

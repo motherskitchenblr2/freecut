@@ -51,6 +51,8 @@ interface MediabunnyVideoTrack {
   displayWidth: number
   displayHeight: number
   canDecode?: () => Promise<boolean>
+  /** True if the track's samples may carry an alpha channel (e.g. VP9/VP8/AV1 with alpha, ProRes 4444). */
+  canBeTransparent?: () => Promise<boolean>
 }
 
 export interface DrawFrameCaptureResult {
@@ -77,11 +79,19 @@ export class VideoFrameExtractor {
   private videoTrack: MediabunnyVideoTrack | null = null
   private duration: number = 0
   private ready: boolean = false
+  /**
+   * Whether the decoded source can carry alpha (resolved once during init).
+   * Consumed by occlusion culling so a full-canvas transparent video never
+   * culls the layers beneath it. Defaults to false (opaque) until init runs.
+   */
+  private canBeTransparent: boolean = false
   private drawFailureCount = 0
   private sampleIterator: AsyncGenerator<MediabunnySample, void, unknown> | null = null
   private currentSample: MediabunnySample | null = null
   private nextSample: MediabunnySample | null = null
   private iteratorDone = false
+  private streamGeneration = 0
+  private disposed = false
   private lastRequestedTimestamp: number | null = null
   private sampleLoopError: unknown = null
   private lastFailureKind: 'none' | 'no-sample' | 'decode-error' = 'none'
@@ -104,6 +114,7 @@ export class VideoFrameExtractor {
    * Initialize the extractor - must be called before drawFrame()
    */
   async init(): Promise<boolean> {
+    this.disposed = false
     try {
       const [mb] = await Promise.all([import('mediabunny'), ensureProResDecoderRegistered()])
       const source = createMediabunnyInputSource(mb, this.src)
@@ -135,6 +146,19 @@ export class VideoFrameExtractor {
           )
           return false
         }
+      }
+
+      // Resolve alpha capability once (codec/container-level signal). VideoSampleSink
+      // decodes and merges alpha side-data automatically, so a transparent source
+      // draws with real alpha — occlusion culling must know this to avoid hiding
+      // the layers beneath a full-canvas transparent overlay.
+      // NOTE: this is a *capability* signal ("may contain alpha"), not per-frame
+      // truth. A fully-opaque clip in an alpha-capable container (VP8/VP9/AV1 with
+      // alpha, ProRes 4444) will conservatively disable occlusion culling for the
+      // layers beneath it — identical output, just a little more work. Opaque H.264
+      // reports false, so the common case (plain video base track) keeps culling.
+      if (typeof this.videoTrack.canBeTransparent === 'function') {
+        this.canBeTransparent = await this.videoTrack.canBeTransparent().catch(() => false)
       }
 
       // Get duration
@@ -358,7 +382,13 @@ export class VideoFrameExtractor {
       return null
     }
 
-    const nextResult = await this.sampleIterator.next()
+    const iterator = this.sampleIterator
+    const generation = this.streamGeneration
+    const nextResult = await iterator.next()
+    if (this.disposed || generation !== this.streamGeneration || iterator !== this.sampleIterator) {
+      if (!nextResult.done) this.closeSample(nextResult.value)
+      return null
+    }
     if (nextResult.done) {
       this.iteratorDone = true
       return null
@@ -528,10 +558,12 @@ export class VideoFrameExtractor {
   }
 
   private closeStreamState(): void {
-    if (this.sampleIterator) {
-      void this.sampleIterator.return?.()
-    }
+    const iterator = this.sampleIterator
     this.sampleIterator = null
+    this.streamGeneration += 1
+    if (iterator) {
+      void iterator.return().catch(() => {})
+    }
     this.iteratorDone = true
     this.lastRequestedTimestamp = null
     this.sampleLoopError = null
@@ -667,9 +699,24 @@ export class VideoFrameExtractor {
   }
 
   /**
+   * Whether the source may carry alpha (resolved during init). Used by occlusion
+   * culling so a full-canvas transparent video does not cull the layers below it.
+   * A source that is not ready (init failed or still pending) cannot paint any
+   * pixels, so it must never be treated as an opaque occluder either — otherwise
+   * a full-canvas video that failed to init would cull every layer beneath it
+   * and the frame would render as a black card.
+   */
+  // Called via the shared extractor pool (shared-video-extractor.ts getItemCanBeTransparent), which static tracing misses
+  // fallow-ignore-next-line unused-class-member
+  getCanBeTransparent(): boolean {
+    return this.canBeTransparent || !this.ready
+  }
+
+  /**
    * Clean up resources
    */
   dispose(): void {
+    this.disposed = true
     this.closeStreamState()
 
     try {

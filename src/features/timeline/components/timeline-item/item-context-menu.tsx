@@ -25,6 +25,7 @@ import { PROPERTY_LABELS, type AnimatableProperty } from '@/types/keyframe'
 import type { PropertyKeyframes } from '@/types/keyframe'
 import {
   getSceneVerificationModelOptions,
+  type SceneDetectionMethod,
   type VerificationModel,
 } from '@/features/timeline/deps/analysis'
 import { formatHotkeyBinding } from '@/config/hotkeys'
@@ -62,10 +63,7 @@ type SceneDetectionActionsProps = ItemContextMenuSectionProps & {
   canDetectScenes?: boolean
   isDetectingScenes?: boolean
   sceneVerificationModelOptions: ReturnType<typeof getSceneVerificationModelOptions>
-  onDetectScenes?: (
-    method: 'histogram' | 'optical-flow',
-    verificationModel?: VerificationModel,
-  ) => void
+  onDetectScenes?: (method: SceneDetectionMethod, verificationModel?: VerificationModel) => void
 }
 
 type CaptionActionsProps = ItemContextMenuSectionProps & {
@@ -286,7 +284,11 @@ const ItemContextMenuFull = memo(function ItemContextMenuFull({
   }, [onPendingActivationHandled, pendingActivation])
 
   return (
-    <ContextMenu>
+    // Keep the timeline menu non-modal. Several actions (including Reverse)
+    // hand off directly to a dialog; overlapping Radix modal layers can race
+    // while restoring `body` pointer events and leave the timeline unable to
+    // receive hover/move events after the dialog closes.
+    <ContextMenu modal={false}>
       <ContextMenuTrigger asChild disabled={trackLocked}>
         <span ref={triggerRef} data-item-context-anchor style={{ display: 'contents' }}>
           {children}
@@ -587,7 +589,7 @@ function SceneDetectionActions({
             {sceneVerificationModelOptions.map((option) => (
               <ContextMenuItem
                 key={option.value}
-                onClick={() => onDetectScenes('optical-flow', option.value)}
+                onClick={() => onDetectScenes('adaptive', option.value)}
               >
                 {t('timeline.contextMenu.detectScenesAi', { model: option.label })}
               </ContextMenuItem>

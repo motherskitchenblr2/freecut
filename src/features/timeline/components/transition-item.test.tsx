@@ -1,3 +1,4 @@
+import { Profiler } from 'react'
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it } from 'vite-plus/test'
 import type { Transition } from '@/types/transition'
@@ -61,7 +62,7 @@ describe('TransitionItem preview bridge motion', () => {
 
   beforeEach(() => {
     useTimelineSettingsStore.setState({ fps: 30 })
-    useZoomStore.getState().setZoomLevelImmediate(1)
+    useZoomStore.getState().setZoomLevelSynchronized(1)
     useItemsStore.getState().setItems([])
     useItemsStore.getState().setTracks([])
     useSelectionStore.setState({ selectedTransitionId: null, dragState: null })
@@ -93,6 +94,33 @@ describe('TransitionItem preview bridge motion', () => {
 
     const updatedLeftPx = parseFloat(screen.getByTitle('Fade (0.7s)').style.left)
     expect(updatedLeftPx - initialLeftPx).toBe(30)
+  })
+
+  it('keeps bridge geometry pinned to clips during live zoom', () => {
+    setTransitionClips()
+    let updateCommits = 0
+
+    render(
+      <Profiler
+        id="transition"
+        onRender={(_id, phase) => {
+          if (phase === 'update') updateCommits++
+        }}
+      >
+        <TransitionItem transition={transition} />
+      </Profiler>,
+    )
+
+    const overlay = screen.getByTitle('Fade (0.7s)')
+    const initialLeft = Number.parseFloat(overlay.style.left)
+    const initialWidth = Number.parseFloat(overlay.style.width)
+
+    act(() => useZoomStore.getState().setZoomLevelImmediate(1.5))
+
+    expect(useZoomStore.getState().contentLevel).toBe(1)
+    expect(Number.parseFloat(overlay.style.left)).toBeCloseTo(initialLeft * 1.5)
+    expect(Number.parseFloat(overlay.style.width)).toBeCloseTo(initialWidth * 1.5)
+    expect(updateCommits).toBe(0)
   })
 
   it('updates bridge position in realtime while rolling preview delta changes', () => {
@@ -178,7 +206,7 @@ describe('TransitionItem preview bridge motion', () => {
 
   it('keeps the existing bridge droppable when zoomed out to its compact minimum width', () => {
     setTransitionClips({ right: { from: 160 } })
-    useZoomStore.getState().setZoomLevelImmediate(0.1)
+    useZoomStore.getState().setZoomLevelSynchronized(0.1)
     useTransitionDragStore
       .getState()
       .setDraggedTransition({ presentation: 'wipe', direction: 'from-left' })

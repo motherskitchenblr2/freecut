@@ -5,6 +5,11 @@
 /* Feature-specific theme extensions */
 @import './features/timeline/theme.css';
 
+body.canvas-translate-cursor-not-allowed,
+body.canvas-translate-cursor-not-allowed * {
+  cursor: not-allowed !important;
+}
+
 @custom-variant dark (&:is(.dark *));
 
 /* Shared easing tokens — strong custom curves, not the weak CSS built-ins.
@@ -146,6 +151,13 @@
   ::-webkit-scrollbar-corner {
     background: oklch(0.15 0 0);
   }
+
+  /* Timeline keyframe sheets reserve a custom overlay rail matching the main
+     timeline, so their native scrollbar must not consume a second gutter. */
+  [data-dopesheet-scroll-viewport]::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
 }
 
 @theme inline {
@@ -271,8 +283,16 @@
   }
 }
 
-.timeline-marquee-preview {
-  box-shadow: inset 0 0 0 1px oklch(var(--primary));
+.timeline-marquee-preview::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+  border: 1px solid var(--primary);
+  border-radius: inherit;
+  background: color-mix(in oklab, var(--primary) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--primary) 35%, transparent);
 }
 
 [data-media-id].media-marquee-preview > * {

@@ -9,6 +9,7 @@ import type { CompositionInputProps } from '@/types/export'
 import type {
   VideoItem,
   AudioItem,
+  AudioDuckingSettings,
   CompositionItem,
   TimelineItem,
   TimelineTrack,
@@ -109,6 +110,11 @@ interface AudioSegment {
   audioCodec?: string // Audio codec for lazy AC-3 decoder registration
   volumeKeyframes?: VolumeKeyframe[] // Animated volume keyframes
   itemFrom: number // Item's timeline start frame (for keyframe offset)
+}
+
+export interface AudioPacketPassthroughPlan {
+  src: string
+  durationSeconds: number
 }
 
 type TransitionAudioItem = VideoItem | AudioItem
@@ -278,7 +284,10 @@ function buildManagedTransitionAudioSegments<TItem extends TransitionAudioItem>(
   transitions: Transition[],
   fps: number,
 ): AudioSegment[] {
-  if (entriesById.size === 0 || transitions.length === 0) return []
+  // Entries that don't participate in any transition still yield plain segments below
+  // (zero extensions) — bailing out on empty `transitions` would silently drop the
+  // embedded audio of every video item in compositions without transitions.
+  if (entriesById.size === 0) return []
 
   const extensionByClipId = new Map<
     string,
@@ -591,6 +600,131 @@ interface AudioProcessingConfig {
   totalFrames: number
 }
 
+/** The wrapper composition item's timing, resolved once per expansion. */
+interface CompositionWrapperTiming {
+  compFrom: number
+  wrapperSpeed: number
+  wrapperSourceFps: number
+  sourceOffset: number
+  wrapperSourceEnd: number
+}
+
+function resolveCompositionWrapper(
+  compositionItem: { from: number; durationInFrames: number } & Partial<{
+    speed: number
+    sourceFps: number
+    sourceStart: number
+    trimStart: number
+    sourceEnd: number
+  }>,
+  fps: number,
+): CompositionWrapperTiming {
+  const wrapperSpeed = compositionItem.speed ?? 1
+  const wrapperSourceFps = compositionItem.sourceFps ?? fps
+  const sourceOffset = compositionItem.sourceStart ?? compositionItem.trimStart ?? 0
+  return {
+    compFrom: compositionItem.from,
+    wrapperSpeed,
+    wrapperSourceFps,
+    sourceOffset,
+    wrapperSourceEnd:
+      compositionItem.sourceEnd ??
+      sourceOffset +
+        timelineToSourceFrames(compositionItem.durationInFrames, wrapperSpeed, fps, wrapperSourceFps),
+  }
+}
+
+/** One nested item's visible window, expressed in PARENT timeline frames. */
+interface NestedItemWindow {
+  overlapStart: number
+  overlapEnd: number
+  effectiveStart: number
+  effectiveEnd: number
+  effectiveDuration: number
+  effectiveSourceStart: number
+}
+
+/**
+ * Map a sub-composition item into parent-timeline coordinates, honouring the
+ * wrapper's trim, speed and source fps. Returns null when the item falls
+ * entirely outside the wrapper's visible source range.
+ *
+ * Shared on purpose. The audio mix and the ducking-source scan both have to
+ * agree on where a nested item sits, and a second implementation is how they
+ * would silently drift apart — a source could be expanded into the mix while
+ * not being seen as a duck source, which is precisely the bug this fixes.
+ */
+function mapNestedItemWindow(
+  subItem: TimelineItem,
+  wrapper: CompositionWrapperTiming,
+  fps: number,
+): NestedItemWindow | null {
+  const { compFrom, wrapperSpeed, wrapperSourceFps, sourceOffset, wrapperSourceEnd } = wrapper
+  const overlapStart = Math.max(subItem.from, sourceOffset)
+  const overlapEnd = Math.min(subItem.from + subItem.durationInFrames, wrapperSourceEnd)
+  if (overlapEnd <= overlapStart) return null
+
+  const effectiveStart =
+    compFrom + sourceToTimelineFrames(overlapStart - sourceOffset, wrapperSpeed, wrapperSourceFps, fps)
+  const effectiveEnd =
+    compFrom + sourceToTimelineFrames(overlapEnd - sourceOffset, wrapperSpeed, wrapperSourceFps, fps)
+  const effectiveDuration = Math.max(1, effectiveEnd - effectiveStart)
+
+  const baseSourceStart = subItem.sourceStart ?? subItem.trimStart ?? 0
+  const effectiveSourceStart =
+    baseSourceStart +
+    timelineToSourceFrames(
+      overlapStart - subItem.from,
+      subItem.speed ?? 1,
+      wrapperSourceFps,
+      subItem.sourceFps ?? wrapperSourceFps,
+    )
+
+  return {
+    overlapStart,
+    overlapEnd,
+    effectiveStart,
+    effectiveEnd,
+    effectiveDuration,
+    effectiveSourceStart,
+  }
+}
+
+/**
+ * Rebuild a nested composition item as a wrapper expressed in PARENT coordinates.
+ *
+ * Shared with the duck-source scan for the same reason the window mapping is: the
+ * `sourceEnd` remap in particular is easy to omit, and omitting it makes a
+ * clipped intermediate composition report a different window on each side.
+ */
+function buildNestedWrapper(
+  subItem: TimelineItem,
+  window: NestedItemWindow,
+  wrapper: CompositionWrapperTiming,
+): CompositionItem | (AudioItem & { compositionId: string }) {
+  const { wrapperSpeed, wrapperSourceFps } = wrapper
+  return {
+    ...subItem,
+    from: window.effectiveStart,
+    durationInFrames: window.effectiveDuration,
+    speed: (subItem.speed ?? 1) * wrapperSpeed,
+    sourceStart: window.effectiveSourceStart,
+    sourceFps: subItem.sourceFps ?? wrapperSourceFps,
+    ...(subItem.sourceEnd !== undefined && {
+      sourceEnd: Math.max(
+        window.effectiveSourceStart + 1,
+        subItem.sourceEnd -
+          timelineToSourceFrames(
+            subItem.from + subItem.durationInFrames - window.overlapEnd,
+            subItem.speed ?? 1,
+            wrapperSourceFps,
+            subItem.sourceFps ?? wrapperSourceFps,
+          ),
+      ),
+    }),
+  } as CompositionItem | (AudioItem & { compositionId: string })
+}
+
 function appendCompositionAudioSegments(params: {
   segments: AudioSegment[]
   track: CompositionInputProps['tracks'][number]
@@ -615,43 +749,19 @@ function appendCompositionAudioSegments(params: {
   const wrapperAudioPitchShiftSemitones =
     (params.audioPitchShiftSemitones ?? 0) + getAudioPitchShiftSemitones(compositionItem)
   const linkedSubCompVideoIds = getLinkedVideoIdsWithAudio(subComp.items)
-  const compFrom = compositionItem.from
-  const wrapperSpeed = compositionItem.speed ?? 1
-  const wrapperSourceFps = compositionItem.sourceFps ?? fps
-  const sourceOffset = compositionItem.sourceStart ?? compositionItem.trimStart ?? 0
-  const wrapperSourceEnd =
-    compositionItem.sourceEnd ??
-    sourceOffset +
-      timelineToSourceFrames(compositionItem.durationInFrames, wrapperSpeed, fps, wrapperSourceFps)
+  const wrapper = resolveCompositionWrapper(compositionItem, fps)
+  const { wrapperSpeed, wrapperSourceFps } = wrapper
   const trackMuted = track.muted ?? false
 
   for (const subItem of subComp.items) {
     const subTrack = subComp.tracks.find((candidate) => candidate.id === subItem.trackId)
     const subTrackMuted = subTrack?.muted ?? false
-    const overlapStart = Math.max(subItem.from, sourceOffset)
-    const overlapEnd = Math.min(subItem.from + subItem.durationInFrames, wrapperSourceEnd)
-    if (overlapEnd <= overlapStart) continue
+    const window = mapNestedItemWindow(subItem, wrapper, fps)
+    if (!window) continue
+    const { overlapStart, overlapEnd, effectiveStart, effectiveDuration } = window
 
-    const effectiveStart =
-      compFrom +
-      sourceToTimelineFrames(overlapStart - sourceOffset, wrapperSpeed, wrapperSourceFps, fps)
-    const effectiveEnd =
-      compFrom +
-      sourceToTimelineFrames(overlapEnd - sourceOffset, wrapperSpeed, wrapperSourceFps, fps)
-    const effectiveDuration = Math.max(1, effectiveEnd - effectiveStart)
-    if (effectiveDuration <= 0) continue
-
-    const subItemClipStart = overlapStart - subItem.from
-    const baseSourceStart = subItem.sourceStart ?? subItem.trimStart ?? 0
     const speed = (subItem.speed ?? 1) * wrapperSpeed
-    const effectiveSourceStart =
-      baseSourceStart +
-      timelineToSourceFrames(
-        subItemClipStart,
-        subItem.speed ?? 1,
-        wrapperSourceFps,
-        subItem.sourceFps ?? wrapperSourceFps,
-      )
+    const effectiveSourceStart = window.effectiveSourceStart
 
     if (subItem.type === 'composition' || isCompositionAudioItem(subItem)) {
       if (
@@ -664,26 +774,7 @@ function appendCompositionAudioSegments(params: {
       const nestedSubComp = useCompositionsStore.getState().getComposition(subItem.compositionId)
       if (!nestedSubComp) continue
 
-      const nestedWrapper = {
-        ...subItem,
-        from: effectiveStart,
-        durationInFrames: effectiveDuration,
-        speed: (subItem.speed ?? 1) * wrapperSpeed,
-        sourceStart: effectiveSourceStart,
-        sourceFps: subItem.sourceFps ?? wrapperSourceFps,
-        ...(subItem.sourceEnd !== undefined && {
-          sourceEnd: Math.max(
-            effectiveSourceStart + 1,
-            subItem.sourceEnd -
-              timelineToSourceFrames(
-                subItem.from + subItem.durationInFrames - overlapEnd,
-                subItem.speed ?? 1,
-                wrapperSourceFps,
-                subItem.sourceFps ?? wrapperSourceFps,
-              ),
-          ),
-        }),
-      } as CompositionItem | (AudioItem & { compositionId: string })
+      const nestedWrapper = buildNestedWrapper(subItem, window, wrapper)
 
       // Volumes are dB offsets — sum them so nested levels accumulate correctly.
       const nestedVisited = new Set(visited)
@@ -1010,6 +1101,184 @@ export function extractAudioSegments(
   return segments
 }
 
+type MediabunnyAudioSampleSink = InstanceType<(typeof import('mediabunny'))['AudioSampleSink']>
+type MediabunnyAudioSample = InstanceType<(typeof import('mediabunny'))['AudioSample']>
+
+interface AudioDecodeAccumulator {
+  channelChunks: Float32Array[][]
+  totalFrames: number
+  sampleRate: number
+  channels: number
+}
+
+function createAudioChannelBackfill(totalFrames: number): Float32Array[] {
+  if (totalFrames === 0) return []
+  return [new Float32Array(totalFrames)]
+}
+
+function appendDecodedAudioSample(
+  state: AudioDecodeAccumulator,
+  sample: MediabunnyAudioSample,
+  itemId: string,
+): void {
+  const frameCount = Math.max(0, sample.numberOfFrames)
+  const sampleChannels = Math.max(1, sample.numberOfChannels)
+  if (frameCount === 0) return
+
+  if (state.channels === 0) {
+    state.channels = sampleChannels
+    for (let channel = 0; channel < state.channels; channel++) state.channelChunks.push([])
+  } else if (sampleChannels > state.channels) {
+    for (let channel = state.channels; channel < sampleChannels; channel++) {
+      state.channelChunks.push(createAudioChannelBackfill(state.totalFrames))
+    }
+    state.channels = sampleChannels
+  } else if (sampleChannels < state.channels) {
+    log.warn('Inconsistent channel count during mediabunny audio decode', {
+      itemId,
+      expectedChannels: state.channels,
+      actualChannels: sampleChannels,
+    })
+  }
+
+  for (let channel = 0; channel < state.channels; channel++) {
+    const channelData = new Float32Array(frameCount)
+    sample.copyTo(channelData, {
+      planeIndex: Math.min(channel, sampleChannels - 1),
+      format: 'f32-planar',
+    })
+    state.channelChunks[channel]!.push(channelData)
+  }
+  state.totalFrames += frameCount
+  if (sample.sampleRate > 0) state.sampleRate = sample.sampleRate
+}
+
+function mergeDecodedAudioChannels(state: AudioDecodeAccumulator): Float32Array[] {
+  return state.channelChunks.map((chunks) => {
+    const merged = new Float32Array(state.totalFrames)
+    let offset = 0
+    for (const chunk of chunks) {
+      merged.set(chunk, offset)
+      offset += chunk.length
+    }
+    return merged
+  })
+}
+
+async function decodeAudioRangeFromSink(
+  sink: MediabunnyAudioSampleSink,
+  itemId: string,
+  startTime: number,
+  endTime: number,
+): Promise<DecodedAudio> {
+  const state: AudioDecodeAccumulator = {
+    channelChunks: [],
+    totalFrames: 0,
+    sampleRate: 48_000,
+    channels: 0,
+  }
+
+  for await (const sample of sink.samples(startTime, endTime)) {
+    try {
+      appendDecodedAudioSample(state, sample, itemId)
+    } finally {
+      sample.close()
+    }
+  }
+
+  if (state.channels === 0 || state.totalFrames === 0) {
+    throw new Error('Audio decode produced no output')
+  }
+
+  return {
+    itemId,
+    sampleRate: state.sampleRate,
+    channels: state.channels,
+    samples: mergeDecodedAudioChannels(state),
+    duration: endTime - startTime,
+  }
+}
+
+async function decodeAudioWithMediabunny(params: {
+  src: string
+  itemId: string
+  startTime?: number
+  endTime?: number
+  audioCodec?: string
+}): Promise<DecodedAudio> {
+  if (isAc3AudioCodec(params.audioCodec)) await ensureAc3DecoderRegistered()
+  const mb = await import('mediabunny')
+  const input = new mb.Input({
+    formats: mb.ALL_FORMATS,
+    source: createMediabunnyInputSource(mb, params.src),
+  })
+  try {
+    const audioTrack = await input.getPrimaryAudioTrack()
+    if (!audioTrack) throw new Error('No audio track found')
+    const duration = await input.computeDuration()
+    const actualStartTime = params.startTime ?? 0
+    const actualEndTime = params.endTime ?? duration
+    log.debug('Extracting audio range', {
+      itemId: params.itemId,
+      startTime: actualStartTime,
+      endTime: actualEndTime,
+      totalDuration: duration,
+    })
+    return await decodeAudioRangeFromSink(
+      new mb.AudioSampleSink(audioTrack),
+      params.itemId,
+      actualStartTime,
+      actualEndTime,
+    )
+  } finally {
+    input.dispose()
+  }
+}
+
+function getCachedAudioDecode(src: string, itemId: string): DecodedAudio | null {
+  const cached = audioDecodeCache.get(src)
+  if (!cached) return null
+  log.debug('Using cached decoded audio', { itemId, src: src.substring(0, 50) })
+  return { ...cached, itemId }
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function recoverAudioDecode(params: {
+  src: string
+  itemId: string
+  startTime?: number
+  endTime?: number
+  audioCodec?: string
+  ac3RetryAttempted: boolean
+  allowWebAudioFallback: boolean
+  error: unknown
+}): Promise<DecodedAudio> {
+  if (!params.ac3RetryAttempted && !isAc3AudioCodec(params.audioCodec)) {
+    try {
+      await ensureAc3DecoderRegistered()
+      return await decodeAudioFromSource(
+        params.src,
+        params.itemId,
+        params.startTime,
+        params.endTime,
+        params.audioCodec,
+        true,
+        params.allowWebAudioFallback,
+      )
+    } catch {
+      // Continue to Web Audio fallback.
+    }
+  }
+  if (!params.allowWebAudioFallback) throw params.error
+  log.warn(
+    `Mediabunny audio decode failed for ${params.itemId}, using fallback: ${getErrorMessage(params.error)}`,
+  )
+  return decodeAudioFallback(params.src, params.itemId, params.startTime, params.endTime)
+}
+
 /**
  * Decode audio from a media source using mediabunny for efficient range extraction.
  * Only decodes the portion of audio actually needed, not the entire file.
@@ -1031,11 +1300,8 @@ async function decodeAudioFromSource(
 ): Promise<DecodedAudio> {
   // Check cache first (only for full file decodes for backward compatibility)
   if (startTime === undefined && endTime === undefined) {
-    const cached = audioDecodeCache.get(src)
-    if (cached) {
-      log.debug('Using cached decoded audio', { itemId, src: src.substring(0, 50) })
-      return { ...cached, itemId }
-    }
+    const cached = getCachedAudioDecode(src, itemId)
+    if (cached) return cached
   }
 
   log.debug('Decoding audio with mediabunny', {
@@ -1047,167 +1313,36 @@ async function decodeAudioFromSource(
   })
 
   try {
-    if (isAc3AudioCodec(audioCodec)) {
-      await ensureAc3DecoderRegistered()
-    }
-
-    // Try mediabunny first for efficient range extraction
-    const mb = await import('mediabunny')
-    const input = new mb.Input({
-      formats: mb.ALL_FORMATS,
-      source: createMediabunnyInputSource(mb, src),
+    const result = await decodeAudioWithMediabunny({
+      src,
+      itemId,
+      startTime,
+      endTime,
+      audioCodec,
     })
-    try {
-      const audioTrack = await input.getPrimaryAudioTrack()
-      if (!audioTrack) {
-        throw new Error('No audio track found')
-      }
 
-      const duration = await input.computeDuration()
-      const actualStartTime = startTime ?? 0
-      const actualEndTime = endTime ?? duration
+    log.debug('Decoded audio with mediabunny', {
+      itemId,
+      sampleRate: result.sampleRate,
+      channels: result.channels,
+      duration: result.duration,
+      samples: result.samples[0]?.length,
+    })
 
-      log.debug('Extracting audio range', {
-        itemId,
-        startTime: actualStartTime,
-        endTime: actualEndTime,
-        totalDuration: duration,
-      })
+    if (startTime === undefined && endTime === undefined) audioDecodeCache.set(src, result)
 
-      // Create audio sample sink and extract only needed range
-      const sink = new mb.AudioSampleSink(audioTrack)
-
-      // Collect planar sample chunks per output channel.
-      const channelChunks: Float32Array[][] = []
-      let totalFrames = 0
-      let sampleRate = 48000
-      let channels = 0
-
-      for await (const sample of sink.samples(actualStartTime, actualEndTime)) {
-        try {
-          const sampleData = sample as {
-            numberOfFrames?: number
-            numberOfChannels?: number
-            sampleRate?: number
-            copyTo: (
-              destination: Float32Array,
-              options: { planeIndex: number; format: 'f32-planar' },
-            ) => void
-          }
-          const frameCount = Math.max(0, sampleData.numberOfFrames ?? 0)
-          const sampleChannels = Math.max(1, sampleData.numberOfChannels ?? 1)
-          if (frameCount === 0) {
-            continue
-          }
-
-          if (channels === 0) {
-            channels = sampleChannels
-            for (let c = 0; c < channels; c++) {
-              channelChunks.push([])
-            }
-          } else if (sampleChannels > channels) {
-            // Rare container edge case: if channel count increases mid-stream,
-            // backfill earlier timeline with silence for newly seen channels.
-            for (let c = channels; c < sampleChannels; c++) {
-              const chunks: Float32Array[] = []
-              if (totalFrames > 0) {
-                chunks.push(new Float32Array(totalFrames))
-              }
-              channelChunks.push(chunks)
-            }
-            channels = sampleChannels
-          } else if (sampleChannels < channels) {
-            log.warn('Inconsistent channel count during mediabunny audio decode', {
-              itemId,
-              expectedChannels: channels,
-              actualChannels: sampleChannels,
-            })
-          }
-
-          const outputChannels = channels || sampleChannels
-          for (let c = 0; c < outputChannels; c++) {
-            const planeIndex = Math.min(c, sampleChannels - 1)
-            const channelData = new Float32Array(frameCount)
-            sampleData.copyTo(channelData, { planeIndex, format: 'f32-planar' })
-            channelChunks[c]!.push(channelData)
-          }
-
-          totalFrames += frameCount
-          if (sampleData.sampleRate && sampleData.sampleRate > 0) {
-            sampleRate = sampleData.sampleRate
-          }
-        } finally {
-          sample.close()
-        }
-      }
-
-      if (channels === 0 || totalFrames === 0) {
-        throw new Error('Audio decode produced no output')
-      }
-
-      // Combine chunks into contiguous per-channel arrays.
-      const samples: Float32Array[] = []
-      for (let c = 0; c < channels; c++) {
-        const merged = new Float32Array(totalFrames)
-        let offset = 0
-        for (const chunk of channelChunks[c] ?? []) {
-          merged.set(chunk, offset)
-          offset += chunk.length
-        }
-        samples.push(merged)
-      }
-
-      const result: DecodedAudio = {
-        itemId,
-        sampleRate,
-        channels,
-        samples,
-        duration: actualEndTime - actualStartTime,
-      }
-
-      log.debug('Decoded audio with mediabunny', {
-        itemId,
-        sampleRate,
-        channels,
-        duration: result.duration,
-        samples: samples[0]?.length,
-      })
-
-      // Cache if full file decode
-      if (startTime === undefined && endTime === undefined) {
-        audioDecodeCache.set(src, result)
-      }
-
-      return result
-    } finally {
-      input.dispose()
-    }
+    return result
   } catch (error) {
-    // Metadata can be missing/stale for some legacy items. If decode fails and
-    // codec did not look like AC-3, retry once after registering the decoder.
-    if (!ac3RetryAttempted && !isAc3AudioCodec(audioCodec)) {
-      try {
-        await ensureAc3DecoderRegistered()
-        return await decodeAudioFromSource(
-          src,
-          itemId,
-          startTime,
-          endTime,
-          audioCodec,
-          true,
-          allowWebAudioFallback,
-        )
-      } catch {
-        // Ignore and continue to Web Audio fallback below.
-      }
-    }
-
-    if (!allowWebAudioFallback) throw error
-
-    // Fall back to Web Audio API. It must decode the full source, but returns
-    // only the requested range so windowed callers keep their bounded shape.
-    log.warn('Mediabunny audio decode failed, using fallback', { itemId, error })
-    return decodeAudioFallback(src, itemId, startTime, endTime)
+    return recoverAudioDecode({
+      src,
+      itemId,
+      startTime,
+      endTime,
+      audioCodec,
+      ac3RetryAttempted,
+      allowWebAudioFallback,
+      error,
+    })
   }
 }
 
@@ -1295,6 +1430,202 @@ async function decodeAudioFallback(
  */
 function dbToGain(db: number): number {
   return Math.pow(10, db / 20)
+}
+
+// ---------------------------------------------------------------------------
+// Sidechain ducking: while a duck-source item is audible, other audio is
+// attenuated by its `duckOthersDb` with attack/release ramps. Applied as a
+// third per-segment gain layer (after volume/fades, before the additive mix),
+// so the source itself and out-of-scope tracks stay untouched.
+// ---------------------------------------------------------------------------
+
+const DUCKING_DEFAULT_ATTACK_SEC = 0.08
+const DUCKING_DEFAULT_RELEASE_SEC = 0.25
+
+export interface DuckingSource {
+  itemId: string
+  trackId: string
+  /** Audible span on the timeline, in project frames. */
+  startFrame: number
+  endFrame: number
+  /** Attenuation while audible, dB (negative). */
+  duckDb: number
+  attackFrames: number
+  releaseFrames: number
+  /** Restrict ducking to these tracks (default: every other track). */
+  targetTrackIds?: string[]
+}
+
+type DuckSourceCandidate = CompositionInputProps['tracks'][number]['items'][number] & {
+  audioDucking?: AudioDuckingSettings
+  embeddedAudioMuted?: boolean
+}
+
+/** Map one item to a duck source, or null when it cannot duck anything. */
+function duckingSourceFromItem(
+  item: DuckSourceCandidate,
+  trackId: string,
+  fps: number,
+  /** Parent-timeline window, for items reached through a pre-composition. */
+  window?: { startFrame: number; endFrame: number },
+): DuckingSource | null {
+  const ducking = item.audioDucking
+  if (!ducking || !(ducking.duckOthersDb < 0)) return null
+  const carriesAudio = item.type === 'audio' || (item.type === 'video' && !item.embeddedAudioMuted)
+  if (!carriesAudio) return null
+  return {
+    itemId: item.id,
+    trackId,
+    startFrame: window?.startFrame ?? item.from,
+    endFrame: window?.endFrame ?? item.from + item.durationInFrames,
+    duckDb: ducking.duckOthersDb,
+    attackFrames: (ducking.attackSec ?? DUCKING_DEFAULT_ATTACK_SEC) * fps,
+    releaseFrames: (ducking.releaseSec ?? DUCKING_DEFAULT_RELEASE_SEC) * fps,
+    ...(ducking.targetTrackIds ? { targetTrackIds: ducking.targetTrackIds } : {}),
+  }
+}
+
+/**
+ * Collect duck sources nested inside a pre-composition, in PARENT timeline frames.
+ *
+ * The mix expands nested composition audio, so a source living one level down is
+ * audible; scanning only the root tracks would leave it audible but not ducking,
+ * making the same arrangement sound different at root level and inside a
+ * pre-comp. The window mapping is shared with `appendCompositionAudioSegments`
+ * so the two cannot disagree about where a nested item sits.
+ */
+function collectNestedDuckingSources(
+  compositionItem: CompositionItem | (AudioItem & { compositionId: string }),
+  rootTrackId: string,
+  fps: number,
+  visited: ReadonlySet<string>,
+): DuckingSource[] {
+  if (visited.has(compositionItem.compositionId)) return []
+  const subComp = useCompositionsStore.getState().getComposition(compositionItem.compositionId)
+  if (!subComp) return []
+
+  const wrapper = resolveCompositionWrapper(compositionItem, fps)
+  const nestedVisited = new Set(visited)
+  nestedVisited.add(compositionItem.compositionId)
+
+  const sources: DuckingSource[] = []
+  for (const subItem of subComp.items) {
+    const subTrack = subComp.tracks.find((candidate) => candidate.id === subItem.trackId)
+    // Only `muted` silences a nested track — the expansion above ignores `visible`,
+    // so excluding hidden tracks here would leave audible sources not ducking.
+    if (subTrack?.muted === true) continue
+
+    const window = mapNestedItemWindow(subItem, wrapper, fps)
+    if (!window) continue
+
+    if (subItem.type === 'composition' || isCompositionAudioItem(subItem)) {
+      // A composition-backed AudioItem can carry `audioDucking` of its own, and it
+      // is audible in its own right — collect it as well as descending.
+      const wrapperSource = duckingSourceFromItem(
+        subItem as DuckSourceCandidate,
+        rootTrackId,
+        fps,
+        { startFrame: window.effectiveStart, endFrame: window.effectiveEnd },
+      )
+      if (wrapperSource) sources.push(wrapperSource)
+      sources.push(
+        ...collectNestedDuckingSources(
+          buildNestedWrapper(subItem, window, wrapper),
+          rootTrackId,
+          fps,
+          nestedVisited,
+        ),
+      )
+      continue
+    }
+
+    // Nested sources belong to the ROOT track: that is the track their audio is
+    // mixed onto, so it is also what "never duck yourself" must compare against.
+    const source = duckingSourceFromItem(subItem as DuckSourceCandidate, rootTrackId, fps, {
+      startFrame: window.effectiveStart,
+      endFrame: window.effectiveEnd,
+    })
+    if (source) sources.push(source)
+  }
+  return sources
+}
+
+/** Collect duck-source windows from composition items carrying `audioDucking`. */
+export function collectDuckingSources(
+  composition: CompositionInputProps,
+  fps: number,
+): DuckingSource[] {
+  return composition.tracks
+    .filter((track) => track.visible !== false && track.muted !== true)
+    .flatMap((track) =>
+      (track.items ?? []).flatMap((item) => {
+        // The item's own `audioDucking` counts even when it is a composition
+        // wrapper — it is audible in its own right — so collect it either way
+        // and additionally descend when it wraps a pre-comp.
+        const own = duckingSourceFromItem(item as DuckSourceCandidate, track.id, fps)
+        const sources = own ? [own] : []
+        if (item.type === 'composition' || isCompositionAudioItem(item)) {
+          sources.push(
+            ...collectNestedDuckingSources(
+              item as CompositionItem | (AudioItem & { compositionId: string }),
+              track.id,
+              fps,
+              new Set<string>(),
+            ),
+          )
+        }
+        return sources
+      }),
+    )
+}
+
+/** Piecewise duck gain of one source at a timeline frame, in dB (0 = no duck). */
+function duckingSourceGainDb(frame: number, source: DuckingSource): number {
+  if (frame < source.startFrame || frame > source.endFrame + source.releaseFrames) return 0
+  if (frame < source.startFrame + source.attackFrames) {
+    const progress = (frame - source.startFrame) / source.attackFrames
+    return source.duckDb * progress
+  }
+  if (frame <= source.endFrame) return source.duckDb
+  const progress = (frame - source.endFrame) / source.releaseFrames
+  return source.duckDb * (1 - progress)
+}
+
+/**
+ * Multiply the ducking envelope into one channel of a target segment.
+ * `segmentStartFrame` is the absolute timeline frame of `samples[0]` (same
+ * mapping as `applyAnimatedVolume`). The source item never ducks itself;
+ * overlapping sources take the deepest (minimum dB) gain.
+ */
+export function applyDucking(
+  samples: Float32Array,
+  sources: readonly DuckingSource[],
+  segment: { itemId: string; trackId: string },
+  segmentStartFrame: number,
+  fps: number,
+  sampleRate: number,
+): Float32Array {
+  const spanFrames = (samples.length / sampleRate) * fps
+  const applicable = sources.filter(
+    (source) =>
+      source.itemId !== segment.itemId &&
+      (!source.targetTrackIds || source.targetTrackIds.includes(segment.trackId)) &&
+      source.startFrame < segmentStartFrame + spanFrames &&
+      source.endFrame + source.releaseFrames > segmentStartFrame,
+  )
+  if (applicable.length === 0) return samples
+
+  const output = new Float32Array(samples.length)
+  for (let i = 0; i < samples.length; i++) {
+    const frame = segmentStartFrame + (i / sampleRate) * fps
+    let db = 0
+    for (const source of applicable) {
+      const sourceDb = duckingSourceGainDb(frame, source)
+      if (sourceDb < db) db = sourceDb
+    }
+    output[i] = db === 0 ? samples[i]! : samples[i]! * dbToGain(db)
+  }
+  return output
 }
 
 /**
@@ -1851,6 +2182,89 @@ export function supportsWindowedAudioProcessing(composition: CompositionInputPro
   return segments.length > 0 && segments.every(supportsWindowedAudioSegment)
 }
 
+function hasPacketCopyTimingChanges(segment: AudioSegment, durationInFrames: number): boolean {
+  return (
+    segment.startFrame !== 0 ||
+    segment.durationFrames !== durationInFrames ||
+    segment.sourceStartFrame !== 0 ||
+    Math.abs(segment.speed - 1) > 0.0001 ||
+    segment.isReversed
+  )
+}
+
+function hasPacketCopyGainChanges(segment: AudioSegment): boolean {
+  return (
+    segment.volume !== 0 ||
+    Boolean(segment.volumeKeyframes?.length) ||
+    segment.fadeInFrames !== 0 ||
+    segment.fadeOutFrames !== 0 ||
+    (segment.crossfadeFadeInFrames ?? 0) !== 0 ||
+    (segment.crossfadeFadeOutFrames ?? 0) !== 0
+  )
+}
+
+function hasPacketCopyContentOffsets(segment: AudioSegment): boolean {
+  return (
+    (segment.contentStartOffsetFrames ?? 0) !== 0 ||
+    (segment.contentEndOffsetFrames ?? 0) !== 0 ||
+    (segment.fadeInDelayFrames ?? 0) !== 0 ||
+    (segment.fadeOutLeadFrames ?? 0) !== 0
+  )
+}
+
+function hasPacketCopyFadeSpans(segment: AudioSegment, durationInFrames: number): boolean {
+  if ((segment.clipFadeSpans?.length ?? 0) > 1) return true
+  return Boolean(
+    segment.clipFadeSpans?.some(
+      (span) =>
+        span.startFrame !== 0 ||
+        span.durationInFrames !== durationInFrames ||
+        span.fadeInFrames !== 0 ||
+        span.fadeOutFrames !== 0,
+    ),
+  )
+}
+
+function hasPacketCopyEffects(segment: AudioSegment): boolean {
+  return (
+    isAudioPitchShiftActive(segment.pitchShiftSemitones) ||
+    segment.audioEqStages.some(isAudioEqStageActive)
+  )
+}
+
+/**
+ * Return a packet-copy plan only when the composition's audio is one continuous,
+ * untouched source starting at timestamp zero. Any gain, fade, DSP, speed,
+ * reverse, trim-at-start, overlap, or master-bus change requires PCM processing.
+ */
+export function getAudioPacketPassthroughPlan(
+  composition: CompositionInputProps,
+): AudioPacketPassthroughPlan | null {
+  const durationInFrames = composition.durationInFrames ?? 0
+  if (durationInFrames <= 0 || composition.fps <= 0 || (composition.masterBusDb ?? 0) !== 0) {
+    return null
+  }
+
+  // Ducking needs no guard here: passthrough requires exactly ONE audible
+  // segment, and a lone duck source has nothing to duck.
+  const segments = extractAudioSegments(composition, composition.fps).filter(
+    (segment) => !segment.muted,
+  )
+  if (segments.length !== 1) return null
+
+  const segment = segments[0]!
+  const hasProcessing = [
+    hasPacketCopyTimingChanges(segment, durationInFrames),
+    hasPacketCopyGainChanges(segment),
+    hasPacketCopyContentOffsets(segment),
+    hasPacketCopyFadeSpans(segment, durationInFrames),
+    hasPacketCopyEffects(segment),
+  ].some(Boolean)
+
+  if (hasProcessing) return null
+  return { src: segment.src, durationSeconds: durationInFrames / composition.fps }
+}
+
 type FramesToSamples = (frames: number | undefined) => number
 
 function applyClipFadeSpanToWindow(
@@ -1979,6 +2393,79 @@ interface AudioWindowIntersection {
   intersectionEnd: number
 }
 
+interface WindowedAudioDecoderPool {
+  decode: (segment: AudioSegment, startTime: number, endTime: number) => Promise<DecodedAudio>
+  dispose: () => Promise<void>
+}
+
+async function createWindowedAudioDecoderPool(): Promise<WindowedAudioDecoderPool> {
+  const mb = await import('mediabunny')
+  type Session = {
+    input: InstanceType<typeof mb.Input>
+    sink: InstanceType<typeof mb.AudioSampleSink>
+    duration: number
+  }
+  const sessions = new Map<string, Promise<Session>>()
+
+  const getSession = (segment: AudioSegment): Promise<Session> => {
+    const existing = sessions.get(segment.src)
+    if (existing) return existing
+    const created = (async () => {
+      const input = new mb.Input({
+        formats: mb.ALL_FORMATS,
+        source: createMediabunnyInputSource(mb, segment.src),
+      })
+      try {
+        const track = await input.getPrimaryAudioTrack()
+        if (!track) throw new Error('No audio track found')
+        return {
+          input,
+          sink: new mb.AudioSampleSink(track),
+          duration: await input.computeDuration(),
+        }
+      } catch (error) {
+        input.dispose()
+        throw error
+      }
+    })()
+    sessions.set(segment.src, created)
+    return created
+  }
+
+  return {
+    async decode(segment, startTime, endTime) {
+      try {
+        const session = await getSession(segment)
+        return await decodeAudioRangeFromSink(
+          session.sink,
+          segment.itemId,
+          Math.max(0, startTime),
+          Math.min(session.duration, endTime),
+        )
+      } catch (error) {
+        log.warn('Persistent audio decoder failed; retrying with isolated decoder', {
+          itemId: segment.itemId,
+          error,
+        })
+        return decodeAudioFromSource(
+          segment.src,
+          segment.itemId,
+          startTime,
+          endTime,
+          segment.audioCodec,
+        )
+      }
+    },
+    async dispose() {
+      const settledSessions = await Promise.allSettled(sessions.values())
+      for (const result of settledSessions) {
+        if (result.status === 'fulfilled') result.value.input.dispose()
+      }
+      sessions.clear()
+    },
+  }
+}
+
 function resolveAudioWindowIntersection(
   segment: AudioSegment,
   chunkStart: number,
@@ -2000,6 +2487,7 @@ async function processAudioWindowChannels(
   intersection: AudioWindowIntersection,
   sampleRate: number,
   fps: number,
+  duckingSources: readonly DuckingSource[] = [],
 ): Promise<Float32Array[]> {
   const processed = decoded.samples
   const decodedSegmentOffset = Math.floor(
@@ -2032,6 +2520,16 @@ async function processAudioWindowChannels(
       decoded.sampleRate,
       fps,
     )
+    if (duckingSources.length > 0) {
+      samples = applyDucking(
+        samples,
+        duckingSources,
+        segment,
+        (intersection.intersectionStart / sampleRate) * fps,
+        fps,
+        decoded.sampleRate,
+      )
+    }
     if (decoded.sampleRate !== sampleRate) {
       samples = await resample(samples, decoded.sampleRate, sampleRate)
     }
@@ -2068,8 +2566,11 @@ async function mixSegmentIntoAudioWindow(params: {
   chunkEnd: number
   sampleRate: number
   fps: number
+  decoderPool: WindowedAudioDecoderPool
+  duckingSources: readonly DuckingSource[]
 }): Promise<void> {
-  const { segment, mixed, chunkStart, chunkEnd, sampleRate, fps } = params
+  const { segment, mixed, chunkStart, chunkEnd, sampleRate, fps, decoderPool, duckingSources } =
+    params
   const intersection = resolveAudioWindowIntersection(
     segment,
     chunkStart,
@@ -2082,12 +2583,10 @@ async function mixSegmentIntoAudioWindow(params: {
   const segmentOffset = intersection.intersectionStart - intersection.segmentStart
   const requestedFrames = intersection.intersectionEnd - intersection.intersectionStart
   const sourceStartTime = segment.sourceStartFrame / segment.sourceFps + segmentOffset / sampleRate
-  const decoded = await decodeAudioFromSource(
-    segment.src,
-    segment.itemId,
+  const decoded = await decoderPool.decode(
+    segment,
     sourceStartTime,
     sourceStartTime + requestedFrames / sampleRate,
-    segment.audioCodec,
   )
   const processed = await processAudioWindowChannels(
     decoded,
@@ -2095,6 +2594,7 @@ async function mixSegmentIntoAudioWindow(params: {
     intersection,
     sampleRate,
     fps,
+    duckingSources,
   )
   mixAudioWindowChannels(
     mixed,
@@ -2139,28 +2639,37 @@ export async function* processAudioWindows(
       ? dbToGain(composition.masterBusDb)
       : 1
 
-  for (let chunkStart = 0; chunkStart < totalSamples; chunkStart += chunkSamples) {
-    if (signal?.aborted) throw new DOMException('Audio processing cancelled', 'AbortError')
+  const duckingSources = collectDuckingSources(composition, fps)
 
-    const chunkLength = Math.min(chunkSamples, totalSamples - chunkStart)
-    const chunkEnd = chunkStart + chunkLength
-    const mixed = [new Float32Array(chunkLength), new Float32Array(chunkLength)]
+  const decoderPool = await createWindowedAudioDecoderPool()
+  try {
+    for (let chunkStart = 0; chunkStart < totalSamples; chunkStart += chunkSamples) {
+      if (signal?.aborted) throw new DOMException('Audio processing cancelled', 'AbortError')
 
-    for (const segment of segments) {
-      await mixSegmentIntoAudioWindow({
-        segment,
-        mixed,
-        chunkStart,
-        chunkEnd,
-        sampleRate,
-        fps,
-      })
+      const chunkLength = Math.min(chunkSamples, totalSamples - chunkStart)
+      const chunkEnd = chunkStart + chunkLength
+      const mixed = [new Float32Array(chunkLength), new Float32Array(chunkLength)]
+
+      for (const segment of segments) {
+        await mixSegmentIntoAudioWindow({
+          segment,
+          mixed,
+          chunkStart,
+          chunkEnd,
+          sampleRate,
+          fps,
+          decoderPool,
+          duckingSources,
+        })
+      }
+
+      softClipAudioMix(mixed)
+      applyAudioWindowMasterGain(mixed, masterGain)
+
+      yield { samples: mixed, sampleRate, channels }
     }
-
-    softClipAudioMix(mixed)
-    applyAudioWindowMasterGain(mixed, masterGain)
-
-    yield { samples: mixed, sampleRate, channels }
+  } finally {
+    await decoderPool.dispose()
   }
 }
 
@@ -2199,6 +2708,8 @@ export async function processAudio(
     await ensureAc3DecoderRegistered()
     log.debug('AC-3 decoder pre-registered for export audio decode')
   }
+
+  const duckingSources = collectDuckingSources(composition, fps)
 
   // Configuration
   const config: AudioProcessingConfig = {
@@ -2343,6 +2854,17 @@ export async function processAudio(
           )
         }
 
+        if (duckingSources.length > 0) {
+          channelSamples = applyDucking(
+            channelSamples,
+            duckingSources,
+            segment,
+            segment.startFrame,
+            fps,
+            decoded.sampleRate,
+          )
+        }
+
         // Resample to target sample rate
         if (decoded.sampleRate !== config.sampleRate) {
           channelSamples = await resample(channelSamples, decoded.sampleRate, config.sampleRate)
@@ -2364,10 +2886,7 @@ export async function processAudio(
         outputSamples: processedChannels[0]?.length,
       })
     } catch (error) {
-      log.error('Failed to process audio segment', {
-        itemId: segment.itemId,
-        error,
-      })
+      log.error(`Failed to process audio segment ${segment.itemId}: ${getErrorMessage(error)}`)
       // Continue with other segments
     }
   }

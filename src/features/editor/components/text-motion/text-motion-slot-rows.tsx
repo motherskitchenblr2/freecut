@@ -33,6 +33,7 @@ import {
   removeTextMotionEffect,
   updateTextMotionLive,
 } from '@/features/editor/deps/timeline-store'
+import { matchesAnimationPresetQuery } from '../animate-workspace/animation-preset-filter'
 
 const SLOTS: readonly TextMotionSlot[] = ['in', 'out', 'loop']
 
@@ -56,6 +57,7 @@ interface TextMotionSlotRowProps {
   onRemove: (slot: TextMotionSlot) => void
   onLiveEdit: (slot: TextMotionSlot, partial: Partial<TextMotionEffectBase>) => void
   onCommitEdit: (slot: TextMotionSlot, partial: Partial<TextMotionEffectBase>) => void
+  showHeading: boolean
   t: TranslateFn
 }
 
@@ -75,11 +77,14 @@ const TextMotionSlotRow = memo(function TextMotionSlotRow({
   onRemove,
   onLiveEdit,
   onCommitEdit,
+  showHeading,
   t,
 }: TextMotionSlotRowProps) {
   return (
     <div className="flex flex-col gap-1.5">
-      <PropertyGroupHeader>{t(`textMotion.slots.${slot}`)}</PropertyGroupHeader>
+      {showHeading ? (
+        <PropertyGroupHeader>{t(`textMotion.slots.${slot}`)}</PropertyGroupHeader>
+      ) : null}
       <div className="grid grid-cols-4 gap-1">
         {presets.map((preset) => {
           const label = t(preset.labelKey)
@@ -185,6 +190,14 @@ const TextMotionSlotRow = memo(function TextMotionSlotRow({
 export interface TextMotionSlotRowsProps {
   /** Selected text items (callers filter the selection to `type === 'text'`). */
   items: TextItem[]
+  /** Optional preset-browser query used by the Motion library. */
+  query?: string
+  /** Limit the shared catalog to specific intent slots. */
+  slots?: readonly TextMotionSlot[]
+  /** Hide the repeated In/Out/Loop label when the parent stage already names it. */
+  showSlotHeading?: boolean
+  /** Let embedded intent stages defer the no-results message to the library. */
+  showEmptyState?: boolean
 }
 
 /**
@@ -196,10 +209,32 @@ export interface TextMotionSlotRowsProps {
  */
 export const TextMotionSlotRows = memo(function TextMotionSlotRows({
   items,
+  query = '',
+  slots = SLOTS,
+  showSlotHeading = true,
+  showEmptyState = true,
 }: TextMotionSlotRowsProps) {
   const { t } = useTranslation()
   const itemIds = useMemo(() => items.map((item) => item.id), [items])
   const firstSpec = items[0]?.textMotion
+  const filteredPresetsBySlot = useMemo(() => {
+    const filterSlot = (slot: TextMotionSlot) =>
+      PRESETS_BY_SLOT[slot].filter(
+        (preset) =>
+          firstSpec?.[slot]?.presetId === preset.id ||
+          matchesAnimationPresetQuery(t(preset.labelKey), query),
+      )
+
+    return {
+      in: filterSlot('in'),
+      out: filterSlot('out'),
+      loop: filterSlot('loop'),
+    }
+  }, [firstSpec, query, t])
+  const visiblePresetCount = slots.reduce(
+    (count, slot) => count + filteredPresetsBySlot[slot].length,
+    0,
+  )
 
   // One coalesced undo per slider drag: snapshot on the first live change,
   // commit on release. A direct commit (select change, typed value) snapshots
@@ -240,21 +275,33 @@ export const TextMotionSlotRows = memo(function TextMotionSlotRows({
 
   if (items.length === 0) return null
 
+  if (visiblePresetCount === 0 && showEmptyState) {
+    return (
+      <p className="py-3 text-center text-xs text-muted-foreground" role="status">
+        {t('editor.animatePresets.noMatches')}
+      </p>
+    )
+  }
+  if (visiblePresetCount === 0) return null
+
   return (
     <div className="flex flex-col gap-3">
-      {SLOTS.map((slot) => (
-        <TextMotionSlotRow
-          key={slot}
-          slot={slot}
-          presets={PRESETS_BY_SLOT[slot]}
-          effect={firstSpec?.[slot]}
-          onApply={handleApply}
-          onRemove={handleRemove}
-          onLiveEdit={handleLiveEdit}
-          onCommitEdit={handleCommitEdit}
-          t={t}
-        />
-      ))}
+      {slots.map((slot) =>
+        filteredPresetsBySlot[slot].length > 0 ? (
+          <TextMotionSlotRow
+            key={slot}
+            slot={slot}
+            presets={filteredPresetsBySlot[slot]}
+            effect={firstSpec?.[slot]}
+            onApply={handleApply}
+            onRemove={handleRemove}
+            onLiveEdit={handleLiveEdit}
+            onCommitEdit={handleCommitEdit}
+            showHeading={showSlotHeading}
+            t={t}
+          />
+        ) : null,
+      )}
     </div>
   )
 })

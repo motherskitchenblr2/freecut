@@ -1,11 +1,12 @@
-import type { CropSettings, TransformProperties } from './transform'
+import type { CropSettings, TransformParentBinding, TransformProperties } from './transform'
 import type { ItemEffect } from './effects'
-import type { MotionModifier } from './motion'
+import type { MotionAnimationLayer, MotionModifier } from './motion'
 import type { BlendMode } from './blend-modes'
 import type { AudioEqSettings } from './audio'
 import type { TextStylePresetId } from '@/shared/typography/text-style-preset-ids'
 import type { TextMotionSpec } from './text-motion'
 import type { TextLayoutDrafts, TextSpan, TextStyleFields } from './text'
+import type { CompositionControlOverrides } from './composition-controls'
 
 export interface TimelineItemCornerPin {
   topLeft: [number, number]
@@ -32,9 +33,25 @@ export interface TimelineTranscriptCaptions {
   mediaId: string
   enabled: boolean
   updatedAt: number
+  /** Version of the stored media transcript these cues were generated from. */
+  sourceTranscriptUpdatedAt?: number
+  /** Bump when transcript-to-caption phrase timing rules change. */
+  timingVersion?: number
   /** Source-relative transcript cues. Render/export trims them to the clip. */
   cues: TimelineTranscriptCaptionCue[]
   style?: TimelineTranscriptCaptionStyle
+}
+
+/** Sidechain ducking settings carried by a duck-source item. */
+export interface AudioDuckingSettings {
+  /** Attenuation applied to other audio while this item is audible, in dB (<= 0). */
+  duckOthersDb: number
+  /** Ramp-down time into the duck, seconds (default 0.08). */
+  attackSec?: number
+  /** Ramp-up time out of the duck, seconds (default 0.25). */
+  releaseSec?: number
+  /** Restrict ducking to these tracks (default: all other audible tracks). */
+  targetTrackIds?: string[]
 }
 
 // Base type for all timeline items (following Composition pattern)
@@ -64,6 +81,9 @@ type BaseTimelineItem = {
   reverseConformPreviewPath?: string // OPFS/workspace cache path for the preview reversed media
   reverseConformPreviewKey?: string // Cache key describing the preview reversed source range
   reverseConformPreviewUsesProxy?: boolean // Whether the preview reversed media was generated from a proxy
+  reverseConformPreviewIsSourceLevel?: boolean // Preview conform contains the entire reversed source
+  reverseConformPreviewSourceDuration?: number // Source duration, in source-native frames, used by the conform
+  reverseConformPreviewFps?: number // Frame rate of the source-level preview conform
   reverseConformStatus?: 'pending' | 'ready' | 'error'
   // Timeline-frame offset into reverseConform{Src,PreviewSrc} where this clip starts
   // playing. Set on split halves so they share the parent's conform but read
@@ -71,6 +91,8 @@ type BaseTimelineItem = {
   reverseConformLocalStart?: number
   // Transform properties (optional - defaults computed at render time)
   transform?: TransformProperties
+  // Optional bind-space parent. Missing on legacy and unparented items.
+  transformParent?: TransformParentBinding
   // Source-relative media crop (normalized edge ratios)
   crop?: CropSettings
   // Audio properties (for video/audio items)
@@ -124,6 +146,13 @@ type BaseTimelineItem = {
   audioEqHighCutEnabled?: boolean // Enable high cut / low-pass filter
   audioEqHighCutFrequencyHz?: number // High cut frequency in Hz
   audioEqHighCutSlopeDbPerOct?: 6 | 12 | 18 | 24 // High cut slope
+  /**
+   * Sidechain ducking: while THIS item is audible, other audio in the mix is
+   * attenuated by `duckOthersDb` with attack/release ramps. Scope with
+   * `targetTrackIds` (default: every other audible track). The source itself
+   * is never ducked by its own envelope.
+   */
+  audioDucking?: AudioDuckingSettings
   // Video properties (for video items)
   fadeIn?: number // Video fade in duration in seconds (default: 0)
   fadeOut?: number // Video fade out duration in seconds (default: 0)
@@ -132,6 +161,9 @@ type BaseTimelineItem = {
   // Procedural motion modifiers — continuous drift/breath/shake evaluated at
   // render time (no baked keyframes). See @/types/motion.
   motionModifiers?: MotionModifier[]
+  // Named post-keyframe animation layers. Unlike Merge Keys, these remain
+  // independently removable and preserve the underlying editable animation.
+  motionLayers?: MotionAnimationLayer[]
   // Blend mode for layer compositing (default: 'normal')
   blendMode?: BlendMode
   // Corner pin transform (perspective warp)
@@ -183,6 +215,14 @@ export type TextItem = BaseTimelineItem &
     type: 'text'
     text: string
     textSpans?: TextSpan[]
+    /**
+     * How `textSpans` flow: 'stack' (default) lays every span out as its own
+     * line group; 'inline' concatenates spans into one wrapped text stream so
+     * a span can recolor/underline words INSIDE a line (karaoke/keyword
+     * accents). Inline flow uses the first span's font/size/letter-spacing for
+     * the whole stream — per-span font/size differences are ignored there.
+     */
+    spanLayout?: 'stack' | 'inline'
     textLayoutDrafts?: TextLayoutDrafts
     textStylePresetId?: TextStylePresetId
     textStyleScale?: number
@@ -269,27 +309,68 @@ export type ShapeType =
   | 'heart'
   | 'path'
 
-export type ShapeItem = BaseTimelineItem & {
-  type: 'shape'
-  shapeType: ShapeType
+export interface ShapeStyleFields {
   // Fill
   fillColor: string
+  fillEnabled?: boolean
+  /** Solid remains the default for legacy projects. */
+  fillType?: 'solid' | 'linear'
+  /** First color of a two-stop linear fill. `fillColor` remains its legacy fallback. */
+  gradientStartColor?: string
+  /** Second color of a two-stop linear fill. */
+  gradientEndColor?: string
+  /** Linear fill direction in degrees. Zero runs left-to-right. */
+  gradientAngle?: number
   // Stroke
   strokeColor?: string
   strokeWidth?: number
-  // Shape-specific
-  cornerRadius?: number // Rect, Triangle, Star, Polygon
-  direction?: 'up' | 'down' | 'left' | 'right' // Triangle only
-  points?: number // Star (5 default), Polygon (6 default)
-  innerRadius?: number // Star only (ratio 0-1 of outer)
-  // Path shape (custom bezier path drawn with pen tool)
-  pathVertices?: import('@/types/masks').MaskVertex[] // Normalized 0-1 vertices for 'path' shapeType
-  // Mask properties
-  isMask?: boolean // When true, shape acts as mask for lower tracks
-  maskType?: 'clip' | 'alpha' // clip = hard edges, alpha = soft edges
-  maskFeather?: number // Feather amount for alpha masks (0-100px, default: 10)
-  maskInvert?: boolean // Invert mask (show outside, hide inside)
+  strokeEnabled?: boolean
+  strokeLineCap?: 'butt' | 'round' | 'square'
+  strokeLineJoin?: 'miter' | 'round' | 'bevel'
+  strokeMiterLimit?: number
+  /** Percentage of the outline at which the visible stroke begins (0-100). */
+  trimPathStart?: number
+  /** Percentage of the outline at which the visible stroke ends (0-100). */
+  trimPathEnd?: number
+  /** Rotates the trimmed stroke around the outline, in degrees. */
+  trimPathOffset?: number
+  /** Stroke width at the beginning of the visible path, as a percentage. */
+  taperStartWidth?: number
+  /** Stroke width at the end of the visible path, as a percentage. */
+  taperEndWidth?: number
+  /** Percentage of the visible path used to blend from the start width. */
+  taperStartLength?: number
+  /** Percentage of the visible path used to blend toward the end width. */
+  taperEndLength?: number
 }
+
+export type ShapeItem = BaseTimelineItem &
+  ShapeStyleFields & {
+    type: 'shape'
+    shapeType: ShapeType
+    // Shape-specific
+    /**
+     * Corner rounding baked into the shape's PATH geometry (Rect, Triangle,
+     * Star, Polygon) — the stroke follows the rounded outline. Not the same
+     * property as `transform.cornerRadius`, which clips an item's rendered
+     * bounding box: setting THAT on a shape clips the box straight through
+     * the stroke instead of rounding the outline. Round a shape here.
+     */
+    cornerRadius?: number
+    direction?: 'up' | 'down' | 'left' | 'right' // Triangle only
+    points?: number // Star (5 default), Polygon (6 default)
+    innerRadius?: number // Star only (ratio 0-1 of outer)
+    // Path shape (custom bezier path drawn with pen tool)
+    pathVertices?: import('@/types/masks').MaskVertex[] // Normalized 0-1 vertices for 'path' shapeType
+    /** Whether a custom path connects its final vertex back to its first. Legacy paths are closed. */
+    pathClosed?: boolean
+    // Mask properties
+    isMask?: boolean // When true, shape acts as mask for lower tracks
+    maskType?: 'clip' | 'alpha' // clip = hard edges, alpha = soft edges
+    maskFeather?: number // Feather amount for alpha masks (0-100px, default: 10)
+    maskOpacity?: number // Matte strength (0-100%, default: 100)
+    maskInvert?: boolean // Invert mask (show outside, hide inside)
+  }
 
 // Adjustment layer - applies effects to all items on tracks ABOVE this track
 export type AdjustmentItem = BaseTimelineItem & {
@@ -301,10 +382,19 @@ export type AdjustmentItem = BaseTimelineItem & {
   effectOpacity?: number // 0-1, defaults to 1
 }
 
+/** Invisible, animatable Null Object; `controller` remains the persisted legacy discriminator. */
+export type ControllerItem = BaseTimelineItem & {
+  type: 'controller'
+  controllerKind: 'null'
+  transform: TransformProperties
+}
+
 // Composition item - references a sub-composition (pre-comp)
 export type CompositionItem = BaseTimelineItem & {
   type: 'composition'
   compositionId: string // References a SubComposition in compositions-store
+  /** Values customized on this instance of the reusable composition. */
+  compositionControlOverrides?: CompositionControlOverrides
   // Dimensions of the sub-composition canvas
   compositionWidth: number
   compositionHeight: number
@@ -379,6 +469,7 @@ export type TimelineItem =
   | LottieItem
   | ShapeItem
   | AdjustmentItem
+  | ControllerItem
   | CompositionItem
   | SubtitleSegmentItem
 
@@ -398,8 +489,8 @@ export interface TimelineTrack {
   order: number
   items: TimelineItem[]
   // Track grouping (subsequences)
-  parentTrackId?: string // ID of the group track this track belongs to
-  isGroup?: boolean // true = container track (no items, only children)
+  parentTrackId?: string // ID of the Layer Group track this track belongs to
+  isGroup?: boolean // true = organizational Layer Group (no items, only children)
   isCollapsed?: boolean // Whether the group's children are collapsed
 }
 

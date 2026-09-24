@@ -258,6 +258,7 @@
       "heroSubtitle": "专业视频编辑，零安装。在你的浏览器中创作精彩内容。",
       "disclaimer": "⚠️ 免责声明：这非常处于测试阶段，可能存在问题。希望你仍能享受这段体验。",
       "getStarted": "开始使用",
+      "viewChangelog": "最新变化",
       "starOnGitHub": "在 GitHub 上点星",
       "showcaseHeading": "功能丰富的编辑能力",
       "showcaseSubheading": "完整的视频编辑套件，就在你的浏览器中。",
@@ -277,17 +278,33 @@
           "title": "时间线编辑",
           "description": "支持视频、音频、文本和形状的多轨编辑"
         },
-        "keyframe": {
-          "title": "简单的关键帧编辑器",
-          "description": "直观的关键帧动画，实现流畅过渡"
+        "motion": {
+          "title": "动效工作区",
+          "description": "使用精确时间控制和可复用缓动创建分层动画"
         },
-        "projects": {
-          "title": "项目管理",
-          "description": "创建、整理和管理你的项目"
+        "colorGrade": {
+          "title": "色彩分级",
+          "description": "使用色轮、曲线、示波器和调整图层进行调色"
+        },
+        "keyframe": {
+          "title": "关键帧编辑器",
+          "description": "在曲线或摄影表视图中精确调整运动"
+        },
+        "semantic": {
+          "title": "语义场景搜索",
+          "description": "根据画面内容搜索并找到合适的时刻"
         },
         "export": {
           "title": "在网页上导出",
           "description": "用你的浏览器在本地渲染你的视频。"
+        },
+        "audioEq": {
+          "title": "音频均衡与混音",
+          "description": "使用可视化均衡器调整片段和轨道音频"
+        },
+        "hotkeys": {
+          "title": "自定义键盘快捷键",
+          "description": "查看、重设、导入和导出编辑快捷键"
         }
       },
       "faq": {
@@ -473,6 +490,12 @@
           "clearKeyframes": "清除所选项目的所有关键帧",
           "keyframeEditorGraph": "将关键帧编辑器切换到图形视图",
           "keyframeEditorDopesheet": "将关键帧编辑器切换到摄影表视图",
+          "keyframeEditorSplit": "将关键帧编辑器切换到拆分视图",
+          "editKeyframeAdd": "在播放头处为所选编辑图层添加关键帧",
+          "keyframePrevious": "跳转到上一个属性关键帧",
+          "keyframeNext": "跳转到下一个属性关键帧",
+          "keyframeToggleAuto": "切换活动属性的自动关键帧",
+          "keyframeFit": "使所选关键帧适合视图",
           "markIn": "标记入点",
           "markOut": "标记出点",
           "clearInOut": "清除入点/出点",
@@ -535,6 +558,13 @@
     "routeError": {
       "title": "出了点问题",
       "description": "FreeCut 无法完成此页面的加载。",
+      "projectNotFoundTitle": "找不到此项目",
+      "projectNotFoundDescription": "该项目可能已被移动或删除，或者你打开的是旧链接。工作区中的其他项目仍然可用。",
+      "backToProjects": "返回项目列表",
+      "supportHint": "如需帮助，请复制错误详情并发送给开发者。",
+      "copyDetails": "复制错误详情",
+      "detailsCopied": "已复制错误详情",
+      "copyFailed": "无法复制详情",
       "causePermission": "FreeCut 已失去使用工作区文件夹的权限。请重新连接，或选择其他文件夹。",
       "causeMissing": "找不到你的工作区文件夹。它可能已被移动、重命名或删除。",
       "causeUnsupported": "你的工作区文件夹位于不支持 FreeCut 所需全部功能的驱动器上。云同步文件夹和网络文件夹经常如此。选择本地磁盘上的文件夹通常可以解决。"

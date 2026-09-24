@@ -1,7 +1,12 @@
 import React, { useEffect, useMemo, useCallback } from 'react'
-import { AbsoluteFill, Sequence, useClock } from '@/runtime/composition-runtime/deps/player'
+import {
+  AbsoluteFill,
+  Sequence,
+  useClock,
+  useClockFrameSelector,
+} from '@/runtime/composition-runtime/deps/player'
 import { timelineToSourceFrames } from '@/runtime/composition-runtime/deps/timeline'
-import { useCurrentFrame, useVideoConfig } from '../hooks/use-player-compat'
+import { useVideoConfig } from '../hooks/use-player-compat'
 import type { CompositionInputProps } from '@/types/export'
 import type { TimelineItem } from '@/types/timeline'
 import { Item, type MaskInfo } from '../components/item'
@@ -25,6 +30,11 @@ import { KeyframesProvider } from '../contexts/keyframes-context'
 import { CompositionSpaceProvider } from '../contexts/composition-space-context'
 import { NestedMediaResolutionProvider } from '../contexts/nested-media-resolution-context'
 import {
+  type LiveItemTransformSource,
+  useLiveTransformDependencySignatureForItems,
+} from '../contexts/live-item-transform-context'
+import { LiveItemTransformProvider } from '../contexts/live-item-transform-provider'
+import {
   buildCompoundAudioTransitionSegments,
   buildStandaloneAudioSegments,
   buildTransitionVideoAudioSegments,
@@ -38,7 +48,7 @@ import {
   type AudioTrackItem,
   type ShapeMaskWithTrackOrder,
 } from '../utils/scene-assembly'
-import { resolveActiveShapeMasksAtFrame } from '../utils/frame-scene'
+import { resolveActiveShapeMasksAtFrame, selectMaskRenderFrame } from '../utils/frame-scene'
 import { KeyframesContext } from '../contexts/keyframes-context-core'
 import {
   EMPTY_MASK_INFOS,
@@ -69,18 +79,36 @@ const VIDEO_CLIP_PREMOUNT_SECONDS = 2
 
 const ActiveMasksContext = React.createContext<MaskInfo[]>(EMPTY_MASK_INFOS)
 
-const FrameActiveMasksProvider: React.FC<{
+type ActiveMasksProviderProps = {
   masks: ShapeMaskWithTrackOrder[]
   canvasWidth: number
   canvasHeight: number
   children: React.ReactNode
-}> = ({ masks, canvasWidth, canvasHeight, children }) => {
-  const frame = useCurrentFrame()
+}
+
+const FrameResolvedActiveMasksProvider: React.FC<ActiveMasksProviderProps> = ({
+  masks,
+  canvasWidth,
+  canvasHeight,
+  children,
+}) => {
+  const selectRelevantMaskFrame = useCallback(
+    (frame: number) => selectMaskRenderFrame(masks, frame),
+    [masks],
+  )
+  const frame = useClockFrameSelector(selectRelevantMaskFrame)
   const { fps } = useVideoConfig()
   const keyframesCtx = React.useContext(KeyframesContext)
   const previousMasksRef = React.useRef<MaskInfo[]>(EMPTY_MASK_INFOS)
+  const maskItems = useMemo(() => masks.map(({ mask }) => mask), [masks])
+  const liveMaskDependencySignature =
+    useLiveTransformDependencySignatureForItems(
+      maskItems,
+      keyframesCtx?.getItemKeyframes,
+    )
 
   const activeMasks = useMemo<MaskInfo[]>(() => {
+    void liveMaskDependencySignature
     if (masks.length === 0) {
       previousMasksRef.current = EMPTY_MASK_INFOS
       return EMPTY_MASK_INFOS
@@ -91,14 +119,40 @@ const FrameActiveMasksProvider: React.FC<{
         canvas: { width: canvasWidth, height: canvasHeight, fps },
         frame,
         getKeyframes: keyframesCtx?.getItemKeyframes,
+        getItem: keyframesCtx?.getItem,
       }),
     )
     const stableMasks = reuseStableMaskInfos(previousMasksRef.current, nextMasks)
     previousMasksRef.current = stableMasks
     return stableMasks
-  }, [masks, canvasWidth, canvasHeight, fps, frame, keyframesCtx])
+  }, [
+    masks,
+    canvasWidth,
+    canvasHeight,
+    fps,
+    frame,
+    keyframesCtx,
+    liveMaskDependencySignature,
+  ])
 
   return <ActiveMasksContext.Provider value={activeMasks}>{children}</ActiveMasksContext.Provider>
+}
+
+/**
+ * Avoid subscribing the entire visual layer to the playback clock when the
+ * composition has no masks. The frame-aware provider is mounted only while
+ * masks exist, so ordinary projects keep this boundary stable during playback.
+ */
+const ActiveMasksProvider: React.FC<ActiveMasksProviderProps> = (props) => {
+  if (props.masks.length === 0) {
+    return (
+      <ActiveMasksContext.Provider value={EMPTY_MASK_INFOS}>
+        {props.children}
+      </ActiveMasksContext.Provider>
+    )
+  }
+
+  return <FrameResolvedActiveMasksProvider {...props} />
 }
 
 /**
@@ -148,6 +202,8 @@ const MaskedItem: React.FC<{
  */
 type MainCompositionProps = CompositionInputProps & {
   useProxyMedia?: boolean
+  transparentBackground?: boolean
+  liveItemTransformSource?: LiveItemTransformSource
 }
 
 export const MainComposition: React.FC<MainCompositionProps> = ({
@@ -159,6 +215,8 @@ export const MainComposition: React.FC<MainCompositionProps> = ({
   width: compositionWidth,
   height: compositionHeight,
   useProxyMedia = false,
+  transparentBackground = false,
+  liveItemTransformSource,
 }) => {
   const { fps, width: renderWidth, height: renderHeight } = useVideoConfig()
 
@@ -174,6 +232,10 @@ export const MainComposition: React.FC<MainCompositionProps> = ({
 
   const projectWidth = compositionWidth ?? renderWidth
   const projectHeight = compositionHeight ?? renderHeight
+  const expressionCanvas = useMemo(
+    () => ({ width: projectWidth, height: projectHeight, fps }),
+    [fps, projectHeight, projectWidth],
+  )
   const canvasWidth = renderWidth
   const canvasHeight = renderHeight
   // NOTE: useCurrentFrame() removed from here to prevent per-frame re-renders.
@@ -182,12 +244,15 @@ export const MainComposition: React.FC<MainCompositionProps> = ({
   // Read preview color directly from store to avoid inputProps changes during color picker drag
   // This prevents Player from seeking/refreshing when user scrubs the color picker
   const canvasBackgroundPreview = useGizmoStore((s) => s.canvasBackgroundPreview)
-  const effectiveBackgroundColor = canvasBackgroundPreview ?? backgroundColor
+  const effectiveBackgroundColor = transparentBackground
+    ? 'transparent'
+    : (canvasBackgroundPreview ?? backgroundColor)
 
   const renderPlan = useMemo(
     () => resolveCompositionRenderPlan({ tracks, transitions }),
     [tracks, transitions],
   )
+  const expressionItems = useMemo(() => tracks.flatMap((track) => track.items), [tracks])
   const { trackRenderState } = renderPlan
   const { maxOrder } = trackRenderState
 
@@ -383,15 +448,16 @@ export const MainComposition: React.FC<MainCompositionProps> = ({
   )
 
   return (
-    <NestedMediaResolutionProvider value={useProxyMedia ? 'proxy' : 'source'}>
-      <KeyframesProvider keyframes={keyframes}>
-        <CompositionSpaceProvider
-          projectWidth={projectWidth}
-          projectHeight={projectHeight}
-          renderWidth={renderWidth}
-          renderHeight={renderHeight}
-        >
-          <AbsoluteFill>
+    <LiveItemTransformProvider source={liveItemTransformSource}>
+      <NestedMediaResolutionProvider value={useProxyMedia ? 'proxy' : 'source'}>
+        <KeyframesProvider keyframes={keyframes} items={expressionItems} canvas={expressionCanvas}>
+          <CompositionSpaceProvider
+            projectWidth={projectWidth}
+            projectHeight={projectHeight}
+            renderWidth={renderWidth}
+            renderHeight={renderHeight}
+          >
+            <AbsoluteFill>
             {/* SVG MASK DEFINITIONS - kept for backward compat with feather/invert that need SVG mask */}
             {/* Shape mask animation is now handled per-item via ActiveMasksProvider + MaskedItem */}
 
@@ -614,7 +680,7 @@ export const MainComposition: React.FC<MainCompositionProps> = ({
 
             {/* ALL VISUAL LAYERS - videos and non-media in SINGLE wrapper for proper z-index stacking */}
             {/* This ensures items from different tracks respect z-index across all types */}
-            <FrameActiveMasksProvider
+            <ActiveMasksProvider
               masks={visibleShapeMasks}
               canvasWidth={canvasWidth}
               canvasHeight={canvasHeight}
@@ -679,10 +745,11 @@ export const MainComposition: React.FC<MainCompositionProps> = ({
                     )
                   })}
               </AbsoluteFill>
-            </FrameActiveMasksProvider>
-          </AbsoluteFill>
-        </CompositionSpaceProvider>
-      </KeyframesProvider>
-    </NestedMediaResolutionProvider>
+            </ActiveMasksProvider>
+            </AbsoluteFill>
+          </CompositionSpaceProvider>
+        </KeyframesProvider>
+      </NestedMediaResolutionProvider>
+    </LiveItemTransformProvider>
   )
 }

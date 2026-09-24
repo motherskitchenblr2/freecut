@@ -3,8 +3,13 @@ import { useShallow } from 'zustand/react/shallow'
 import type { MutableRefObject, RefObject } from 'react'
 import type { TimelineItem } from '@/types/timeline'
 import { useItemsStore } from '../../stores/items-store'
+import { getTrackItemRelations } from '../../stores/items-store-indexes'
 import { useSelectionStore } from '@/shared/state/selection'
-import { dragOffsetRef, dragPreviewOffsetByItemRef } from '../../hooks/use-timeline-drag'
+import {
+  dragOffsetRef,
+  dragPreviewOffsetByItemRef,
+  isLargeAltDragCanvasItem,
+} from '../../hooks/use-timeline-drag'
 import {
   getTimelineItemDragParticipation,
   shouldDimTimelineItemForDrag,
@@ -34,6 +39,48 @@ interface UseDragVisualStateResult {
   shouldDimForDrag: boolean
 }
 
+interface ActiveDragVisual {
+  update: () => void
+}
+
+function setStyleIfChanged<K extends keyof CSSStyleDeclaration>(
+  style: CSSStyleDeclaration,
+  property: K,
+  value: CSSStyleDeclaration[K],
+) {
+  if (style[property] !== value) {
+    style[property] = value
+  }
+}
+
+const activeDragVisuals = new Set<ActiveDragVisual>()
+let sharedDragVisualRaf: number | null = null
+
+function runSharedDragVisualFrame() {
+  sharedDragVisualRaf = null
+  for (const visual of activeDragVisuals) {
+    visual.update()
+  }
+  if (activeDragVisuals.size > 0) {
+    sharedDragVisualRaf = requestAnimationFrame(runSharedDragVisualFrame)
+  }
+}
+
+function registerDragVisual(visual: ActiveDragVisual) {
+  activeDragVisuals.add(visual)
+  if (sharedDragVisualRaf === null) {
+    sharedDragVisualRaf = requestAnimationFrame(runSharedDragVisualFrame)
+  }
+}
+
+function unregisterDragVisual(visual: ActiveDragVisual) {
+  activeDragVisuals.delete(visual)
+  if (activeDragVisuals.size === 0 && sharedDragVisualRaf !== null) {
+    cancelAnimationFrame(sharedDragVisualRaf)
+    sharedDragVisualRaf = null
+  }
+}
+
 export function useDragVisualState({
   item,
   gestureMode,
@@ -44,34 +91,14 @@ export function useDragVisualState({
   const wasDraggingRef = useRef(false)
   const isAnyDragActiveRef = useRef(false)
   const dragWasActiveRef = useRef(false)
-  const rafIdRef = useRef<number | null>(null)
   const dragWasActiveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const neighboringJoinIds = useItemsStore(
-    useShallow((state) => {
-      const trackItems = state.itemsByTrackId[item.trackId] ?? []
-      let leftId: string | null = null
-      let rightId: string | null = null
-      const itemStart = item.from
-      const itemEnd = item.from + item.durationInFrames
-
-      for (const other of trackItems) {
-        if (other.id === item.id) continue
-
-        if (other.from + other.durationInFrames === itemStart) {
-          leftId = other.id
-        } else if (other.from === itemEnd) {
-          rightId = other.id
-        }
-
-        if (leftId && rightId) break
-      }
-
-      return { leftId, rightId }
-    }),
+    useShallow(
+      (state) => getTrackItemRelations(state.itemsByTrackId[item.trackId], item).dragNeighborIds,
+    ),
   )
 
-  const isDragActive = useSelectionStore((state) => !!state.dragState?.isDragging)
   const dragParticipation = useSelectionStore((state) =>
     getTimelineItemDragParticipation({
       itemId: item.id,
@@ -103,37 +130,42 @@ export function useDragVisualState({
   dragParticipationRef.current = dragParticipation
 
   useEffect(() => {
-    const previousWasActive = isAnyDragActiveRef.current
-    isAnyDragActiveRef.current = isDragActive
+    const updateDragActiveRefs = (isDragActive: boolean) => {
+      const previousWasActive = isAnyDragActiveRef.current
+      isAnyDragActiveRef.current = isDragActive
 
-    if (previousWasActive && !isDragActive) {
-      dragWasActiveRef.current = true
-      if (dragWasActiveTimeoutRef.current) {
-        clearTimeout(dragWasActiveTimeoutRef.current)
+      if (previousWasActive && !isDragActive) {
+        dragWasActiveRef.current = true
+        if (dragWasActiveTimeoutRef.current) {
+          clearTimeout(dragWasActiveTimeoutRef.current)
+        }
+        dragWasActiveTimeoutRef.current = setTimeout(() => {
+          dragWasActiveRef.current = false
+          dragWasActiveTimeoutRef.current = null
+        }, 100)
       }
-      dragWasActiveTimeoutRef.current = setTimeout(() => {
-        dragWasActiveRef.current = false
-        dragWasActiveTimeoutRef.current = null
-      }, 100)
     }
-  }, [isDragActive])
+
+    updateDragActiveRefs(!!useSelectionStore.getState().dragState?.isDragging)
+    return useSelectionStore.subscribe((state, previousState) => {
+      const isDragActive = !!state.dragState?.isDragging
+      if (isDragActive === !!previousState.dragState?.isDragging) return
+      updateDragActiveRefs(isDragActive)
+    })
+  }, [])
 
   useEffect(() => {
     const cleanupDragStyles = () => {
-      if (rafIdRef.current) {
-        cancelAnimationFrame(rafIdRef.current)
-        rafIdRef.current = null
-      }
-
       if (transformRef.current) {
-        transformRef.current.style.transition = 'none'
-        transformRef.current.style.transform = ''
-        transformRef.current.style.pointerEvents = ''
-        transformRef.current.style.zIndex = ''
+        const style = transformRef.current.style
+        setStyleIfChanged(style, 'transition', 'none')
+        setStyleIfChanged(style, 'transform', '')
+        setStyleIfChanged(style, 'pointerEvents', '')
+        setStyleIfChanged(style, 'zIndex', '')
       }
 
       if (ghostRef.current) {
-        ghostRef.current.style.display = 'none'
+        setStyleIfChanged(ghostRef.current.style, 'display', 'none')
       }
     }
 
@@ -143,40 +175,61 @@ export function useDragVisualState({
       const participation = dragParticipationRef.current
       const isPartOfDrag = participation > 0 && !isDragging
       const isAltPreviewDrag = participation === 2
+      const shouldUpdatePreview = isPartOfDrag || isAltPreviewDrag
 
-      if (!isPartOfDrag) {
+      if (!shouldUpdatePreview) {
         cleanupDragStyles()
+        return
+      }
+
+      if (isAltPreviewDrag && isLargeAltDragCanvasItem(item.id)) {
+        const style = transformRef.current.style
+        setStyleIfChanged(style, 'transform', '')
+        setStyleIfChanged(style, 'transition', 'none')
+        setStyleIfChanged(style, 'pointerEvents', 'none')
+        if (ghostRef.current) {
+          setStyleIfChanged(ghostRef.current.style, 'display', 'none')
+        }
         return
       }
 
       const offset = dragPreviewOffsetByItemRef.current[item.id] ?? dragOffsetRef.current
 
       if (isAltPreviewDrag) {
-        transformRef.current.style.transform = ''
-        transformRef.current.style.transition = 'none'
-        transformRef.current.style.pointerEvents = 'none'
+        const style = transformRef.current.style
+        setStyleIfChanged(style, 'transform', '')
+        setStyleIfChanged(style, 'transition', 'none')
+        setStyleIfChanged(style, 'pointerEvents', 'none')
 
         if (ghostRef.current) {
-          ghostRef.current.style.transform = `translate(${offset.x}px, ${offset.y}px)`
-          ghostRef.current.style.display = 'block'
+          const ghostStyle = ghostRef.current.style
+          setStyleIfChanged(ghostStyle, 'transform', `translate(${offset.x}px, ${offset.y}px)`)
+          setStyleIfChanged(ghostStyle, 'display', 'block')
         }
       } else {
-        transformRef.current.style.transform = `translate(${offset.x}px, ${offset.y}px)`
-        transformRef.current.style.transition = 'none'
-        transformRef.current.style.pointerEvents = 'none'
-        transformRef.current.style.zIndex = '50'
+        const style = transformRef.current.style
+        setStyleIfChanged(style, 'transform', `translate(${offset.x}px, ${offset.y}px)`)
+        setStyleIfChanged(style, 'transition', 'none')
+        setStyleIfChanged(style, 'pointerEvents', 'none')
+        setStyleIfChanged(style, 'zIndex', '50')
 
         if (ghostRef.current) {
-          ghostRef.current.style.display = 'none'
+          setStyleIfChanged(ghostRef.current.style, 'display', 'none')
         }
       }
-
-      rafIdRef.current = requestAnimationFrame(updateTransform)
     }
 
-    if (dragParticipation > 0 && !isDragging) {
-      rafIdRef.current = requestAnimationFrame(updateTransform)
-      return cleanupDragStyles
+    if (dragParticipation > 0 && (!isDragging || dragParticipation === 2)) {
+      if (dragParticipation === 2 && isLargeAltDragCanvasItem(item.id)) {
+        updateTransform()
+        return cleanupDragStyles
+      }
+      const visual: ActiveDragVisual = { update: updateTransform }
+      registerDragVisual(visual)
+      return () => {
+        unregisterDragVisual(visual)
+        cleanupDragStyles()
+      }
     }
 
     cleanupDragStyles()

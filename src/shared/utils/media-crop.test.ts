@@ -72,6 +72,13 @@ describe('media-crop', () => {
     })
   })
 
+  it('crops fill-fitted compound output without changing its stretched bounds', () => {
+    const layout = calculateMediaCropLayout(1920, 1080, 400, 400, { left: 0.1, top: 0.25 }, 'fill')
+
+    expect(layout.mediaRect).toEqual({ x: 0, y: 0, width: 400, height: 400 })
+    expect(layout.viewportRect).toEqual({ x: 40, y: 100, width: 360, height: 300 })
+  })
+
   it('round-trips crop ratios through source pixels', () => {
     expect(cropRatioToPixels(0.125, 1920)).toBe(240)
     expect(cropPixelsToRatio(240, 1920)).toBeCloseTo(0.125)
@@ -141,5 +148,44 @@ describe('media-crop', () => {
   it('detects when any crop edge is active', () => {
     expect(hasMediaCrop()).toBe(false)
     expect(hasMediaCrop({ bottom: 0.01 })).toBe(true)
+  })
+})
+
+describe('calculateMediaCropLayout refit', () => {
+  it('fits the CROPPED region into the container (crop applies to the source)', () => {
+    // Bug-report numbers: show a 1080x922 window of a 1080x9056 page screenshot
+    // WITHOUT sizing the container to the full source and offsetting manually.
+    const source = { width: 1080, height: 9056 }
+    const container = { width: 1080, height: 922 }
+    const crop = { bottom: 1 - 922 / 9056, refit: true }
+
+    const layout = calculateMediaCropLayout(
+      source.width,
+      source.height,
+      container.width,
+      container.height,
+      crop,
+    )
+
+    // The visible (cropped) window fills the container exactly.
+    expect(layout.cropViewportRect.x).toBeCloseTo(0, 3)
+    expect(layout.cropViewportRect.y).toBeCloseTo(0, 3)
+    expect(layout.cropViewportRect.width).toBeCloseTo(container.width, 3)
+    expect(layout.cropViewportRect.height).toBeCloseTo(container.height, 3)
+    // The full source sits scaled 1:1 with its top edge at the container top.
+    expect(layout.mediaRect.y).toBeCloseTo(0, 3)
+    expect(layout.mediaRect.height).toBeCloseTo(source.height, 3)
+  })
+
+  it('keeps legacy in-place semantics when refit is not set', () => {
+    const withRefit = calculateMediaCropLayout(1000, 1000, 500, 500, { left: 0.5, refit: true })
+    const without = calculateMediaCropLayout(1000, 1000, 500, 500, { left: 0.5 })
+    // Legacy: remainder stays in place inside the contain-fitted rect.
+    expect(without.cropViewportRect.width).toBeCloseTo(250, 3)
+    expect(without.mediaRect.width).toBeCloseTo(500, 3)
+    // Refit: the cropped half fills the container height-limited fit.
+    expect(withRefit.cropViewportRect.width).toBeCloseTo(250, 3)
+    expect(withRefit.cropViewportRect.height).toBeCloseTo(500, 3)
+    expect(withRefit.mediaRect.width).toBeCloseTo(500 * 2 * 0.5, 3)
   })
 })

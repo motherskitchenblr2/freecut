@@ -9,6 +9,8 @@ describe('playback-store', () => {
       currentFrameEpoch: 0,
       isPlaying: false,
       playbackRate: 1,
+      transportMode: 'normal',
+      playbackScrubResumeTransport: null,
       loop: false,
       volume: 1,
       muted: false,
@@ -93,6 +95,80 @@ describe('playback-store', () => {
       const stateD = usePlaybackStore.getState()
       expect(stateC).toBe(stateD)
     })
+
+    it.each([
+      {
+        command: 'play',
+        run: () => usePlaybackStore.getState().play(),
+        expected: { isPlaying: true, playbackRate: 1, transportMode: 'normal' },
+      },
+      {
+        command: 'play/pause',
+        run: () => usePlaybackStore.getState().togglePlayPause(),
+        expected: { isPlaying: true, playbackRate: 1, transportMode: 'normal' },
+      },
+      {
+        command: 'forward shuttle',
+        run: () => usePlaybackStore.getState().shuttleForward(),
+        expected: { isPlaying: true, playbackRate: 1, transportMode: 'shuttle' },
+      },
+      {
+        command: 'reverse shuttle',
+        run: () => usePlaybackStore.getState().shuttleReverse(),
+        expected: { isPlaying: true, playbackRate: -1, transportMode: 'shuttle' },
+      },
+      {
+        command: 'pause',
+        run: () => usePlaybackStore.getState().pause(),
+        expected: { isPlaying: false, playbackRate: 1, transportMode: 'normal' },
+      },
+      {
+        command: 'rate change',
+        run: () => usePlaybackStore.getState().setPlaybackRate(2),
+        expected: { isPlaying: false, playbackRate: 2, transportMode: 'normal' },
+      },
+    ])('keeps a newer $command command after scrub release', ({ run, expected }) => {
+      usePlaybackStore.setState({
+        isPlaying: true,
+        playbackRate: 4,
+        transportMode: 'shuttle',
+      })
+      usePlaybackStore.getState().beginPlaybackScrub()
+
+      run()
+      usePlaybackStore.getState().resumePlaybackAfterScrub()
+
+      expect(usePlaybackStore.getState()).toMatchObject({
+        ...expected,
+        playbackScrubResumeTransport: null,
+      })
+    })
+
+    it('clears active skimming atomically when playback starts', () => {
+      usePlaybackStore.getState().setPreviewFrame(42, 'item-1')
+      const beforePlay = usePlaybackStore.getState()
+
+      usePlaybackStore.getState().play()
+
+      const playing = usePlaybackStore.getState()
+      expect(playing.isPlaying).toBe(true)
+      expect(playing.previewFrame).toBeNull()
+      expect(playing.previewItemId).toBeNull()
+      expect(playing.previewFrameEpoch).toBeGreaterThan(beforePlay.previewFrameEpoch)
+      expect(playing.previewFrameEpoch).toBe(playing.frameUpdateEpoch)
+    })
+
+    it('clears active skimming when toggle starts playback', () => {
+      usePlaybackStore.getState().setPreviewFrame(42, 'item-1')
+
+      usePlaybackStore.getState().togglePlayPause()
+
+      expect(usePlaybackStore.getState()).toMatchObject({
+        isPlaying: true,
+        previewFrame: null,
+        previewItemId: null,
+      })
+    })
   })
 
   describe('playback rate', () => {
@@ -102,6 +178,53 @@ describe('playback-store', () => {
 
       usePlaybackStore.getState().setPlaybackRate(0.5)
       expect(usePlaybackStore.getState().playbackRate).toBe(0.5)
+    })
+
+    it('applies J/L shuttle transitions atomically and resets on pause', () => {
+      const listener = vi.fn()
+      const unsubscribe = usePlaybackStore.subscribe(listener)
+
+      usePlaybackStore.getState().shuttleForward()
+      expect(usePlaybackStore.getState()).toMatchObject({
+        isPlaying: true,
+        playbackRate: 1,
+        transportMode: 'shuttle',
+      })
+      expect(listener).toHaveBeenCalledTimes(1)
+
+      listener.mockClear()
+      usePlaybackStore.getState().shuttleForward()
+      expect(usePlaybackStore.getState().playbackRate).toBe(2)
+      expect(listener).toHaveBeenCalledTimes(1)
+
+      listener.mockClear()
+      usePlaybackStore.getState().shuttleReverse()
+      expect(usePlaybackStore.getState()).toMatchObject({
+        isPlaying: true,
+        playbackRate: -1,
+        transportMode: 'shuttle',
+      })
+      expect(listener).toHaveBeenCalledTimes(1)
+
+      listener.mockClear()
+      usePlaybackStore.getState().pause()
+      expect(usePlaybackStore.getState()).toMatchObject({
+        isPlaying: false,
+        playbackRate: 1,
+        transportMode: 'normal',
+      })
+      expect(listener).toHaveBeenCalledTimes(1)
+      unsubscribe()
+    })
+
+    it('keeps shuttle rate out of persisted playback settings', () => {
+      usePlaybackStore.getState().shuttleReverse()
+      const options = usePlaybackStore.persist.getOptions()
+      const persisted = options.partialize?.(usePlaybackStore.getState())
+
+      expect(persisted).not.toHaveProperty('playbackRate')
+      expect(persisted).not.toHaveProperty('isPlaying')
+      expect(persisted).not.toHaveProperty('transportMode')
     })
   })
 
@@ -192,6 +315,28 @@ describe('playback-store', () => {
       expect(state.currentFrameEpoch).toBe(state.previewFrameEpoch)
     })
 
+    it('finishes a transient scrub in one atomic state update', () => {
+      usePlaybackStore.setState({
+        currentFrame: 10,
+        previewFrame: 42,
+        previewItemId: 'item-1',
+        compositionVisualFrozen: true,
+      })
+      const listener = vi.fn()
+      const unsubscribe = usePlaybackStore.subscribe(listener)
+
+      usePlaybackStore.getState().finishScrub(42)
+
+      expect(listener).toHaveBeenCalledTimes(1)
+      expect(usePlaybackStore.getState()).toMatchObject({
+        currentFrame: 42,
+        previewFrame: null,
+        previewItemId: null,
+        compositionVisualFrozen: false,
+      })
+      unsubscribe()
+    })
+
     it('avoids entering scrub mode when the paused ruler clicks the already-current frame', () => {
       usePlaybackStore.getState().setCurrentFrame(42)
       const stateA = usePlaybackStore.getState()
@@ -202,6 +347,21 @@ describe('playback-store', () => {
       expect(stateB).toBe(stateA)
       expect(stateB.currentFrame).toBe(42)
       expect(stateB.previewFrame).toBeNull()
+    })
+
+    it('rejects hover and scrub frame writes during playback', () => {
+      usePlaybackStore.getState().setCurrentFrame(12)
+      usePlaybackStore.getState().play()
+      const playing = usePlaybackStore.getState()
+
+      usePlaybackStore.getState().setPreviewFrame(42, 'item-1')
+      usePlaybackStore.getState().setScrubFrame(42, 'item-1')
+
+      const afterSkimAttempts = usePlaybackStore.getState()
+      expect(afterSkimAttempts).toBe(playing)
+      expect(afterSkimAttempts.currentFrame).toBe(12)
+      expect(afterSkimAttempts.previewFrame).toBeNull()
+      expect(afterSkimAttempts.previewItemId).toBeNull()
     })
   })
 })

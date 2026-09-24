@@ -132,7 +132,7 @@ Runs on-device in the browser — nothing is uploaded.
 
 - On-device transcription with the Parakeet engine (Whisper fallback) and generated caption text items
 - AI captioning with local vision-language providers and configurable sample cadence
-- Scene detection with histogram, optical-flow, and optional model verification workflows
+- Scene detection with fast histogram or frame-accurate adaptive content analysis and optional model verification
 - Scene Browser for searching captioned media and reusing detected moments
 - Local Kokoro text-to-speech voiceovers
 - Local MusicGen music generation with presets, progress, and cancellation
@@ -222,13 +222,17 @@ npm run perf                # Build + serve a production-like perf target
 npm run lint                # Oxlint through Vite+
 npm run format              # Oxfmt
 npm run test:run            # Run the test suite once (npm run test to watch)
-npm run verify              # Full local quality gate (lint, types, tests, arch checks)
+npm run verify              # Full gate: static/arch/unit/build + portable headless contracts
+npm run headless:test       # Build once, then run the complete portable headless suite
 
 npm run routes              # Regenerate the TanStack Router route tree
 ```
 
 `npm run verify` runs the complete quality gate, including architecture and
-dead-code checks scoped to the current diff; the pre-push hook runs the same set.
+dead-code checks scoped to the current diff, all Node headless contracts, the
+built-harness Chrome regression, every public edit operation, and generated
+media/audio rendering. Real-GPU effects remain an explicit operator/release
+gate because hosted PR CI does not provide a portable WebGPU adapter.
 
 ### Performance Checks
 
@@ -258,18 +262,19 @@ Platform-coupled code (GPU, ML, audio, storage, browser) lives in
 `@/infrastructure/*` and is imported directly; there is no separate `lib/`
 layer.
 
-For the full directory breakdown, see the layer notes:
-
-- [src/infrastructure/README.md](src/infrastructure/README.md)
-- [src/shared/README.md](src/shared/README.md)
-- Feature `deps/README.md` files inside individual feature folders
-
 ## Contributing
 
-FreeCut is open source but not open contribution. Pull requests are not accepted at this time.
+FreeCut welcomes contributions that match the current priorities.
 
-- **Report bugs:** open an issue
-- **Suggest features:** start a discussion
+Current development priorities, in order:
+
+1. Bug fixes across FreeCut.
+2. Performance improvements for the live editor and playback, plus faster exports.
+3. New features that have been discussed first.
+
+- **Report bugs:** [open an issue](https://github.com/walterlow/freecut/issues/new?template=bug_report.yml) with reproducible steps, your browser version, and screenshots or recordings
+- **Report performance problems:** include the editing or export workflow, source media details, project size, and when the slowdown begins
+- **Discuss feature ideas:** join the [FreeCut Discord](https://discord.gg/aQtQ7NyUBd) or [start a GitHub Discussion](https://github.com/walterlow/freecut/discussions) before implementation. New features may be considered, but bug fixes and performance work take priority
 
 ## License
 

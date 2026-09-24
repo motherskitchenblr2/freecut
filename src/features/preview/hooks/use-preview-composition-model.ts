@@ -12,9 +12,11 @@ import { resolveEffectiveTrackStates } from '@/features/preview/deps/timeline-ut
 import { useCompositionsStore, useItemsStore } from '@/features/preview/deps/timeline-store'
 import { appendVirtualTranscriptCaptionTrack } from '@/features/preview/deps/caption-items'
 import { useCornerPinStore } from '../stores/corner-pin-store'
-import { useGizmoStore } from '../stores/gizmo-store'
+import { useGizmoStore, type ItemPreview } from '../stores/gizmo-store'
 import { useMaskEditorStore } from '../stores/mask-editor-store'
+import { resolveGizmoWorldPreviewAsLocal } from '../utils/gizmo-world-preview'
 import { resolveProxyUrl } from '../utils/media-resolver'
+import { getRealtimePreviewRenderSize } from '../utils/preview-render-size'
 import {
   getMediaResolveCost,
   toTrackTopologyFingerprint,
@@ -57,6 +59,11 @@ interface PreviewProject {
   backgroundColor?: string
 }
 
+interface PreviewPlayerSize {
+  width: number
+  height: number
+}
+
 interface BuildPreviewCompositionDataParams {
   combinedTracks: TimelineTrack[]
   fps: number
@@ -68,6 +75,7 @@ interface BuildPreviewCompositionDataParams {
   useProxy: boolean
   blobUrlVersion: number
   project: PreviewProject
+  previewRenderSize?: PreviewPlayerSize
   resolveProxyUrlFn?: (mediaId: string) => string | null
   getBlobUrlFn?: (mediaId: string) => string | null
 }
@@ -84,6 +92,7 @@ interface UsePreviewCompositionModelParams {
   proxyReadyCount: number
   blobUrlVersion: number
   project: PreviewProject
+  playerSize: PreviewPlayerSize
 }
 
 interface UsePreviewCompositionBaseModelParams {
@@ -92,13 +101,75 @@ interface UsePreviewCompositionBaseModelParams {
   mediaById: Record<string, Parameters<typeof getMediaResolveCost>[0]>
 }
 
+/**
+ * Apply transient panel edits to the item snapshot consumed by the canvas
+ * renderer. The DOM player subscribes to the same preview store directly, but
+ * the paused fast-scrub canvas needs the values merged into its live snapshot.
+ */
+export function mergeLiveItemPreview(
+  item: TimelineItem,
+  preview: ItemPreview | undefined,
+): TimelineItem {
+  let liveItem = preview?.properties ? ({ ...item, ...preview.properties } as TimelineItem) : item
+
+  if (liveItem.type === 'lottie' && preview?.lottie) {
+    liveItem = { ...liveItem, ...preview.lottie }
+  }
+
+  return liveItem
+}
+
+/**
+ * Keep item-local presentation fields current while the composition-wide item
+ * snapshot is deferred. Timeline placement/topology still comes from the
+ * stable snapshot, but a just-committed text resize must not briefly combine
+ * its new transform with stale typography after the gizmo preview clears.
+ */
+export function mergeLiveItemPresentation(
+  item: TimelineItem,
+  liveItem: TimelineItem | undefined,
+): TimelineItem {
+  if (!liveItem || liveItem.id !== item.id || liveItem.type !== item.type) return item
+
+  const itemWithLiveTransform =
+    'transform' in liveItem && 'transform' in item && liveItem.transform !== item.transform
+      ? ({ ...item, transform: liveItem.transform } as TimelineItem)
+      : item
+
+  if (item.type !== 'text' || liveItem.type !== 'text') return itemWithLiveTransform
+
+  return {
+    ...itemWithLiveTransform,
+    text: liveItem.text,
+    textSpans: liveItem.textSpans,
+    spanLayout: liveItem.spanLayout,
+    textStyleScale: liveItem.textStyleScale,
+    textMotion: liveItem.textMotion,
+    color: liveItem.color,
+    fontSize: liveItem.fontSize,
+    fontFamily: liveItem.fontFamily,
+    fontWeight: liveItem.fontWeight,
+    fontStyle: liveItem.fontStyle,
+    underline: liveItem.underline,
+    letterSpacing: liveItem.letterSpacing,
+    backgroundColor: liveItem.backgroundColor,
+    backgroundRadius: liveItem.backgroundRadius,
+    textAlign: liveItem.textAlign,
+    verticalAlign: liveItem.verticalAlign,
+    lineHeight: liveItem.lineHeight,
+    textPadding: liveItem.textPadding,
+    textShadow: liveItem.textShadow,
+    stroke: liveItem.stroke,
+  } as TimelineItem
+}
+
 export function usePreviewCompositionBaseModel({
   tracks,
   itemsByTrackId,
   mediaById,
 }: UsePreviewCompositionBaseModelParams) {
-  // resolveEffectiveTrackStates applies parent group gate behavior (mute/hide/lock)
-  // and filters out group container tracks (which hold no items)
+  // resolveEffectiveTrackStates applies parent layer-group state (mute/hide/lock/solo)
+  // and filters out Layer Group containers (which hold no items)
   const combinedTracks = useMemo(() => {
     const effectiveTracks = resolveEffectiveTrackStates(tracks).toSorted(
       (a, b) => b.order - a.order,
@@ -135,7 +206,24 @@ export function usePreviewCompositionModel({
   proxyReadyCount,
   blobUrlVersion,
   project,
+  playerSize,
 }: UsePreviewCompositionModelParams) {
+  const projectWidth = project.width
+  const projectHeight = project.height
+  const playerWidth = playerSize.width
+  const playerHeight = playerSize.height
+  const calculatedPreviewRenderSize = getRealtimePreviewRenderSize(
+    { width: projectWidth, height: projectHeight },
+    { width: playerWidth, height: playerHeight },
+  )
+  const previewRenderWidth = calculatedPreviewRenderSize.width
+  const previewRenderHeight = calculatedPreviewRenderSize.height
+  // Keep renderer identity stable while the layout changes inside the same
+  // physical-size bucket (especially <=1080p projects, which stay full-size).
+  const previewRenderSize = useMemo(
+    () => ({ width: previewRenderWidth, height: previewRenderHeight }),
+    [previewRenderHeight, previewRenderWidth],
+  )
   const {
     playbackVideoSourceSpans,
     scrubVideoSourceSpans,
@@ -163,6 +251,7 @@ export function usePreviewCompositionModel({
       useProxy,
       blobUrlVersion,
       project,
+      previewRenderSize,
     })
   }, [
     blobUrlVersion,
@@ -172,24 +261,12 @@ export function usePreviewCompositionModel({
     items,
     keyframes,
     project,
+    previewRenderSize,
     proxyReadyCount,
     resolvedUrls,
     transitions,
     useProxy,
   ])
-
-  const getPreviewTransformOverride = useCallback(
-    (itemId: string): Partial<ResolvedTransform> | undefined => {
-      const gizmoState = useGizmoStore.getState()
-      const unifiedPreviewTransform = gizmoState.preview?.[itemId]?.transform
-      if (unifiedPreviewTransform) return unifiedPreviewTransform
-      if (gizmoState.activeGizmo?.itemId === itemId && gizmoState.previewTransform) {
-        return gizmoState.previewTransform
-      }
-      return undefined
-    },
-    [],
-  )
 
   const getPreviewEffectsOverride = useCallback((itemId: string): ItemEffect[] | undefined => {
     const gizmoState = useGizmoStore.getState()
@@ -245,16 +322,38 @@ export function usePreviewCompositionModel({
   )
   fastScrubKeyframesByItemIdRef.current = fastScrubKeyframesByItemId
 
+  const getPreviewTransformOverride = useCallback(
+    (itemId: string): Partial<ResolvedTransform> | undefined => {
+      const gizmoState = useGizmoStore.getState()
+      const unifiedPreviewTransform = gizmoState.preview?.[itemId]?.transform
+      if (unifiedPreviewTransform) return unifiedPreviewTransform
+      if (gizmoState.activeGizmo?.itemId !== itemId || !gizmoState.previewTransform) {
+        return undefined
+      }
+
+      const playbackState = usePlaybackStore.getState()
+      return resolveGizmoWorldPreviewAsLocal({
+        itemId,
+        worldPreviewTransform: gizmoState.previewTransform,
+        canvas: { width: project.width, height: project.height, fps },
+        frame: playbackState.previewFrame ?? playbackState.currentFrame,
+        getItem: (candidateId) => fastScrubLiveItemsByIdRef.current.get(candidateId),
+        getKeyframes: (candidateId) => fastScrubKeyframesByItemIdRef.current.get(candidateId),
+        getLocalPreviewTransform: (candidateId) =>
+          useGizmoStore.getState().preview?.[candidateId]?.transform,
+      })
+    },
+    [fps, project.height, project.width],
+  )
+
   const getLiveItemSnapshot = useCallback((itemId: string) => {
     const item = fastScrubLiveItemsByIdRef.current.get(itemId)
-    // Merge any live Lottie edit preview (color/text/slot drag) so the canvas
-    // reflects it without a timeline-store commit. Each present field replaces
-    // the committed map wholesale; absent fields fall through to `item`.
-    if (item?.type === 'lottie') {
-      const lottiePreview = useGizmoStore.getState().preview?.[itemId]?.lottie
-      if (lottiePreview) return { ...item, ...lottiePreview }
-    }
-    return item
+    if (!item) return undefined
+    const liveItem = useItemsStore.getState().itemById[itemId]
+    return mergeLiveItemPreview(
+      mergeLiveItemPresentation(item, liveItem),
+      useGizmoStore.getState().preview?.[itemId],
+    )
   }, [])
 
   const getLiveKeyframes = useCallback((itemId: string) => {
@@ -295,6 +394,7 @@ export function buildPreviewCompositionData({
   useProxy,
   blobUrlVersion,
   project,
+  previewRenderSize,
   resolveProxyUrlFn = resolveProxyUrl,
   getBlobUrlFn = (mediaId: string) => blobUrlManager.get(mediaId),
 }: BuildPreviewCompositionDataParams) {
@@ -327,7 +427,7 @@ export function buildPreviewCompositionData({
       const proxyUrl =
         item.type === 'video' ? resolveProxyUrlFn(item.mediaId) || sourceUrl : sourceUrl
       const resolvedSrc = useProxy && item.type === 'video' ? proxyUrl : sourceUrl
-      const fastScrubSrc = item.type === 'video' ? proxyUrl : sourceUrl
+      const fastScrubSrc = resolvedSrc
       const hasMatchingAudioSrc = item.type !== 'video' || item.audioSrc === sourceUrl
 
       const resolvedItem =
@@ -424,10 +524,7 @@ export function buildPreviewCompositionData({
     width: Math.max(2, project.width),
     height: Math.max(2, project.height),
   }
-  const renderSize = {
-    width: Math.max(2, Math.max(1, Math.round(project.width))),
-    height: Math.max(2, Math.max(1, Math.round(project.height))),
-  }
+  const renderSize = previewRenderSize ?? playerRenderSize
   const fastScrubScaledTracks = fastScrubTracks as CompositionInputProps['tracks']
   const fastScrubScaledKeyframes = keyframes
   const fastScrubInputProps: CompositionInputProps = {

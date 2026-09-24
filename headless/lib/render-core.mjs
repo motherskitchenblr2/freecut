@@ -5,15 +5,36 @@ import { execSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import fs from 'node:fs'
 import path from 'node:path'
-import { loadProject, collectMediaIds, resolveMediaFiles, resolveMediaFile, readMediaMetadata } from './workspace.mjs'
+import {
+  loadProject,
+  collectMediaIds,
+  resolveMediaFiles,
+  resolveMediaFile,
+  readMediaMetadata,
+} from './workspace.mjs'
 import { createMediaServer } from '../media-server.mjs'
 import { createHarnessServer } from '../server.mjs'
+import { normalizeRenderInput, renderRequestSchema, validate } from './contract.mjs'
+import { HttpError } from './http-security.mjs'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 
-const CODEC_MAP = { h264: 'avc', avc: 'avc', h265: 'hevc', hevc: 'hevc', vp9: 'vp9', vp8: 'vp8', av1: 'av1' }
+const CODEC_MAP = {
+  h264: 'avc',
+  avc: 'avc',
+  h265: 'hevc',
+  hevc: 'hevc',
+  vp9: 'vp9',
+  vp8: 'vp8',
+  av1: 'av1',
+}
 const DEFAULT_CONTAINER = { avc: 'mp4', hevc: 'mp4', vp9: 'webm', vp8: 'webm', av1: 'webm' }
-const VIDEO_BITRATE_BY_QUALITY = { low: 2_500_000, medium: 5_000_000, high: 10_000_000, ultra: 20_000_000 }
+const VIDEO_BITRATE_BY_QUALITY = {
+  low: 2_500_000,
+  medium: 5_000_000,
+  high: 10_000_000,
+  ultra: 20_000_000,
+}
 
 /** Build ClientExportSettings from a job's options (same keys as the CLI flags). */
 function buildSettings(project, opts) {
@@ -23,13 +44,19 @@ function buildSettings(project, opts) {
   let height = meta.height ?? 1080
   if (opts.resolution) {
     const m = /^(\d+)x(\d+)$/.exec(opts.resolution)
-    if (!m) throw new Error(`Invalid resolution "${opts.resolution}" (expected WxH, e.g. 1920x1080)`)
+    if (!m)
+      throw new Error(`Invalid resolution "${opts.resolution}" (expected WxH, e.g. 1920x1080)`)
     width = Number(m[1])
     height = Number(m[2])
   }
+  if (!Number.isFinite(fps) || fps < 1 || fps > 240)
+    throw new Error('Effective fps must be between 1 and 240')
+  if (![width, height].every((value) => Number.isInteger(value) && value >= 16 && value <= 16384)) {
+    throw new Error('Effective resolution dimensions must be integers between 16 and 16384')
+  }
   const quality = opts.quality ?? 'high'
 
-  if (opts['audio-only'] || opts.audioOnly) {
+  if (opts.audioOnly) {
     const container = opts.container ?? 'mp3'
     return {
       mode: 'audio',
@@ -62,13 +89,17 @@ function buildSettings(project, opts) {
 
 /** Compute the render range (frames) from a job's in/out-sec/duration (seconds). */
 function computeRange(opts, fps) {
-  const inV = opts.in ?? opts.inSec
-  const outV = opts['out-sec'] ?? opts.outSec
+  const inV = opts.inSec
+  const outV = opts.outSec
   const hasRange = inV !== undefined || outV !== undefined || opts.duration !== undefined
   if (!hasRange) return { hasRange: false, inPoint: null, outPoint: null }
   const inSec = inV !== undefined ? Number(inV) : 0
   const outSec =
-    outV !== undefined ? Number(outV) : opts.duration !== undefined ? inSec + Number(opts.duration) : undefined
+    outV !== undefined
+      ? Number(outV)
+      : opts.duration !== undefined
+        ? inSec + Number(opts.duration)
+        : undefined
   return {
     hasRange: true,
     inPoint: Math.round(inSec * fps),
@@ -97,9 +128,14 @@ export async function startHarness({ workspace, devUrl, build }) {
   const resolveMedia = workspace ? (mediaId) => resolveMediaFile(workspace, mediaId) : undefined
   if (devUrl) {
     await ensureHarnessReachable(devUrl)
-    if (!resolveMedia) return { harnessUrl: devUrl, mediaUrlOf: () => undefined, closeServers: async () => {} }
+    if (!resolveMedia)
+      return { harnessUrl: devUrl, mediaUrlOf: () => undefined, closeServers: async () => {} }
     const mediaServer = await createMediaServer(resolveMedia)
-    return { harnessUrl: devUrl, mediaUrlOf: (id) => mediaServer.url(id), closeServers: () => mediaServer.close() }
+    return {
+      harnessUrl: devUrl,
+      mediaUrlOf: (id) => mediaServer.url(id),
+      closeServers: () => mediaServer.close(),
+    }
   }
   const distDir = path.join(REPO_ROOT, 'dist')
   if (!fs.existsSync(path.join(distDir, 'headless.html'))) {
@@ -112,28 +148,54 @@ export async function startHarness({ workspace, devUrl, build }) {
     }
   }
   const server = await createHarnessServer({ distDir, resolveMedia })
-  return { harnessUrl: server.harnessUrl, mediaUrlOf: (id) => server.mediaUrl(id), closeServers: () => server.close() }
+  return {
+    harnessUrl: server.harnessUrl,
+    mediaUrlOf: (id) => server.mediaUrl(id),
+    closeServers: () => server.close(),
+  }
 }
 
-/** Resolve everything needed to render one job (no browser involved). */
-export function prepareJob(workspace, jobArgs, mediaUrlOf) {
-  if (!jobArgs.project && !jobArgs.projectObject) throw new Error('Job missing "project"')
-  const { project, projectJsonPath } = jobArgs.projectObject
-    ? { project: jobArgs.projectObject, projectJsonPath: '(inline)' }
-    : loadProject(workspace, jobArgs.project)
-  const settings = buildSettings(project, jobArgs)
-  const { hasRange, inPoint, outPoint } = computeRange(jobArgs, settings.fps)
-
-  const mediaIds = collectMediaIds(
-    project,
-    hasRange ? { inFrame: inPoint ?? 0, outFrame: outPoint ?? Number.POSITIVE_INFINITY } : null,
-  )
+/**
+ * Resolve the media a project references to `{ mediaId, url, metadata }` entries
+ * the harness can consume. `range` ({ inFrame, outFrame }) limits collection to
+ * media overlapping a slice; pass null for the whole project. Shared by the
+ * render, frame-grab, and layout-dump paths (no browser involved).
+ */
+export function resolveProjectMedia(workspace, project, mediaUrlOf, range = null) {
+  const mediaIds = collectMediaIds(project, range)
   const { files, missing } = resolveMediaFiles(workspace, mediaIds)
   const media = [...files.keys()].map((id) => ({
     mediaId: id,
     url: mediaUrlOf(id),
     metadata: readMediaMetadata(workspace, id) ?? undefined,
   }))
+  return { media, missing, mediaResolved: files.size, mediaTotal: mediaIds.length }
+}
+
+/** Load a project from a job's `project` id/path or inline `projectObject`. */
+export function loadJobProject(workspace, jobArgs) {
+  if (!jobArgs.project && !jobArgs.projectObject) throw new Error('Job missing "project"')
+  return jobArgs.projectObject
+    ? { project: jobArgs.projectObject, projectJsonPath: '(inline)' }
+    : loadProject(workspace, jobArgs.project)
+}
+
+/** Resolve everything needed to render one job (no browser involved). */
+export function prepareJob(workspace, jobArgs, mediaUrlOf) {
+  jobArgs = validate(renderRequestSchema, normalizeRenderInput(jobArgs))
+  const { project, projectJsonPath } = loadJobProject(workspace, jobArgs)
+  const settings = buildSettings(project, jobArgs)
+  const { hasRange, inPoint, outPoint } = computeRange(jobArgs, settings.fps)
+
+  const range = hasRange
+    ? { inFrame: inPoint ?? 0, outFrame: outPoint ?? Number.POSITIVE_INFINITY }
+    : null
+  const { media, missing, mediaResolved, mediaTotal } = resolveProjectMedia(
+    workspace,
+    project,
+    mediaUrlOf,
+    range,
+  )
 
   const outName = `${(project.name ?? 'freecut-export').replace(/[^\w.-]+/g, '_')}.${settings.container}`
   const outPath = path.resolve(jobArgs.out ?? path.join('headless', 'output', outName))
@@ -147,29 +209,111 @@ export function prepareJob(workspace, jobArgs, mediaUrlOf) {
     outPoint,
     media,
     missing,
-    mediaResolved: files.size,
-    mediaTotal: mediaIds.length,
+    mediaResolved,
+    mediaTotal,
     outPath,
+    strict: jobArgs.strict === true,
   }
 }
 
-/** Render one prepared job through an already-loaded harness page; saves to job.outPath. */
-export async function renderJob(page, job, { setProgressLabel, onWarn } = {}) {
-  fs.mkdirSync(path.dirname(job.outPath), { recursive: true })
-  const warn = onWarn ?? ((m) => console.warn(m))
-  if (job.missing.length > 0) {
-    warn(`  WARNING: ${job.missing.length} media source(s) not found on disk: ${job.missing.join(', ')}`)
+export class MissingMediaError extends Error {
+  constructor(mediaIds) {
+    super(`Referenced media source(s) not found on disk: ${mediaIds.join(', ')}`)
+    this.name = 'MissingMediaError'
+    this.code = 'MISSING_MEDIA'
+    this.mediaIds = mediaIds
   }
-  const unsupportedAudio = job.media.filter((m) => m.metadata?.audioCodecSupported === false)
+}
+
+class HardwareGpuRequiredError extends HttpError {
+  constructor() {
+    super(
+      422,
+      'HARDWARE_GPU_REQUIRED',
+      'This project uses GPU effects, but the active WebGPU adapter is software-only. ' +
+        'Run on a native Linux host with NVIDIA Vulkan support or render natively.',
+    )
+    this.name = 'HardwareGpuRequiredError'
+  }
+}
+
+function projectUsesGpuEffects(project) {
+  const timeline = project?.timeline
+  if (!timeline) return false
+  const timelines = [timeline, ...(timeline.compositions ?? [])]
+  return timelines.some((entry) =>
+    (entry.items ?? []).some((item) => item.effects?.some((effect) => effect.enabled)),
+  )
+}
+
+export function assertHardwareGpuForJob(job, softwareGpu) {
+  if (softwareGpu && projectUsesGpuEffects(job.project)) {
+    throw new HardwareGpuRequiredError()
+  }
+}
+
+export function outputPathForContainer(requestedPath, container) {
+  const extension = path.extname(requestedPath)
+  return `${extension ? requestedPath.slice(0, -extension.length) : requestedPath}.${container}`
+}
+
+function warningMessage(warning) {
+  return typeof warning === 'string' ? warning : warning.message
+}
+
+export function warningsHeaderValue(warnings) {
+  return JSON.stringify(warnings).replace(/[^\t\x20-\x7E]/g, ' ')
+}
+
+/** Render one prepared job through an already-loaded harness page; saves to job.outPath. */
+export async function renderJob(
+  page,
+  job,
+  {
+    setProgressLabel,
+    onWarn,
+    allowMissingMedia = false,
+    softwareGpu = false,
+    downloadTimeoutMs = 30 * 60_000,
+  } = {},
+) {
+  const warn = onWarn ?? ((m) => console.warn(m))
+  assertHardwareGpuForJob(job, softwareGpu)
+  if (job.missing.length > 0) {
+    if (!allowMissingMedia) throw new MissingMediaError(job.missing)
+  }
+  const preparationWarnings = []
+  if (job.missing.length > 0)
+    preparationWarnings.push({
+      code: 'MISSING_MEDIA',
+      message: `${job.missing.length} media source(s) not found on disk: ${job.missing.join(', ')}`,
+      details: { mediaIds: job.missing },
+    })
+  // audioCodecSupported=false on media WITHOUT any audio track is a metadata
+  // authoring bug (seen with external registration scripts) — only warn when
+  // there is an actual audio track that can't be decoded.
+  const unsupportedAudio = job.media.filter(
+    (m) => m.metadata?.audioCodecSupported === false && m.metadata?.audioCodec,
+  )
   if (unsupportedAudio.length > 0) {
     const list = unsupportedAudio
       .map((m) => `${m.metadata.fileName ?? m.mediaId} (${m.metadata.audioCodec ?? 'unknown'})`)
       .join(', ')
-    warn(`  WARNING: audio may be silent (codec not decodable headlessly): ${list}`)
+    preparationWarnings.push({
+      code: 'UNSUPPORTED_AUDIO',
+      message: `Audio may be silent (codec not decodable headlessly): ${list}`,
+      details: {
+        media: unsupportedAudio.map((m) => ({
+          mediaId: m.mediaId,
+          fileName: m.metadata.fileName,
+          audioCodec: m.metadata.audioCodec ?? 'unknown',
+        })),
+      },
+    })
   }
 
   setProgressLabel?.(path.basename(job.outPath))
-  const downloadPromise = page.waitForEvent('download', { timeout: 30 * 60_000 })
+  const downloadPromise = page.waitForEvent('download', { timeout: downloadTimeoutMs })
   downloadPromise.catch(() => {})
   const summary = await page.evaluate((payload) => window.freecut.renderProject(payload), {
     project: job.project,
@@ -178,9 +322,16 @@ export async function renderJob(page, job, { setProgressLabel, onWarn } = {}) {
     renderWholeProject: !job.hasRange,
     inPoint: job.inPoint,
     outPoint: job.outPoint,
+    strict: job.strict,
   })
   const download = await downloadPromise
-  await download.saveAs(job.outPath)
-  for (const w of summary.warnings ?? []) warn(`  WARNING: ${w}`)
-  return summary
+  const effectiveContainer = summary.effectiveSettings?.container
+  if (!effectiveContainer) throw new Error('Render summary omitted effectiveSettings.container')
+  const outputPath = outputPathForContainer(job.outPath, effectiveContainer)
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true })
+  await download.saveAs(outputPath)
+  const warnings = [...preparationWarnings, ...(summary.warnings ?? [])]
+  for (const warning of warnings)
+    warn(`  WARNING [${warning.code ?? 'UNKNOWN'}]: ${warningMessage(warning)}`)
+  return { ...summary, fileName: path.basename(outputPath), outputPath, warnings }
 }

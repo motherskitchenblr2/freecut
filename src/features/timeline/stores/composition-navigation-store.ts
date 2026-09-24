@@ -29,6 +29,9 @@ interface StashedTimeline {
   keyframes: ItemKeyframes[]
   /** Playhead frame at the time of stashing, so we can restore it on exit */
   currentFrame: number
+  /** Timeline view state kept with the data snapshot for non-navigating persistence. */
+  zoomLevel?: number
+  scrollPosition?: number
   busAudioEq?: AudioEqSettings
   /** Per-timeline markers + in/out range, swapped alongside the clips. */
   markers: ProjectMarker[]
@@ -145,6 +148,8 @@ function captureCurrentTimeline(compositionId: string | null): StashedTimeline {
     transitions: useTransitionsStore.getState().transitions,
     keyframes: useKeyframesStore.getState().keyframes,
     currentFrame: usePlaybackStore.getState().currentFrame,
+    zoomLevel: useZoomStore.getState().level,
+    scrollPosition: useTimelineSettingsStore.getState().scrollPosition,
     busAudioEq: usePlaybackStore.getState().busAudioEq,
     markers: markersState.markers,
     inPoint: markersState.inPoint,
@@ -168,9 +173,17 @@ function restoreTimeline(stash: StashedTimeline) {
 /** Save current timeline data back to the compositions store (for sub-comps only). */
 function saveCurrentToComposition(compositionId: string) {
   const items = useItemsStore.getState().items
-  // Compute updated duration from the furthest item end
-  const durationInFrames =
+  const currentComposition = useCompositionsStore.getState().getComposition(compositionId)
+  const contentEnd =
     items.length > 0 ? Math.max(...items.map((i) => i.from + i.durationInFrames)) : 0
+  // A layer composition's canvas duration is authored (see setCompositionDuration)
+  // and must survive an empty scene, short layers *and* layers that run past the
+  // end — extending it to fit content here would undo any duration the user set in
+  // the properties panel. Editorial compound clips stay content-derived.
+  const durationInFrames =
+    currentComposition?.editorKind === 'composite-2d'
+      ? Math.max(1, currentComposition.durationInFrames)
+      : contentEnd
   const markersState = useMarkersStore.getState()
 
   useCompositionsStore.getState().updateComposition(compositionId, {
@@ -390,6 +403,28 @@ export const useCompositionNavigationStore = create<
     const currentTabId = getActiveTabId(state.breadcrumbs)
 
     if (currentTabId === sequenceId) {
+      // A refresh/HMR can preserve the selected sequence id after its isolated
+      // runtime holder has been lost. In that state the UI says Motion is open
+      // while the live domain stores still contain Main. Rebuild the sequence
+      // root from the registry instead of accepting the id as sufficient proof
+      // that the correct timeline is loaded.
+      if (sequenceId !== null && state.mainHolder === null) {
+        const comp = useCompositionsStore.getState().getComposition(sequenceId)
+        if (!comp) return
+        const mainStash = captureCurrentTimeline(null)
+        loadComposition(sequenceId)
+        usePlaybackStore.getState().setCurrentFrame(0)
+        setActiveCompositionId(sequenceId)
+        useTimelineCommandStore.getState().setActiveContext(sequenceId)
+        set({
+          breadcrumbs: [{ compositionId: sequenceId, label: comp.name }],
+          activeCompositionId: sequenceId,
+          stashStack: [],
+          mainHolder: mainStash,
+        })
+        applySequenceView(useSequencesStore.getState().getSequenceView(tabViewKey(sequenceId)))
+        return
+      }
       // Already on this tab; collapse any drill-in back to its root.
       if (state.breadcrumbs.length > 1) {
         get().navigateTo(0)

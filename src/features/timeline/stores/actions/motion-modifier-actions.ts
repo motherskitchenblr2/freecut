@@ -6,8 +6,11 @@
  * existing modifier of the same type on that item (apply == set, not stack).
  */
 
-import type { MotionModifier, MotionModifierType } from '@/types/motion'
-import type { AudioPulseModulation } from '@/types/effects'
+import type {
+  MotionAnimationLayer,
+  MotionModifier,
+  MotionModifierType,
+} from '@/types/motion'
 import type { AnimatableProperty } from '@/types/keyframe'
 import type { TimelineItem } from '@/types/timeline'
 import { useItemsStore } from '../items-store'
@@ -28,6 +31,55 @@ function getLog() {
 export interface MotionModifierAssignment {
   itemId: string
   modifier: MotionModifier
+}
+
+export interface MotionLayerAssignment {
+  itemId: string
+  layer: MotionAnimationLayer
+}
+
+/** Attach one independently removable additive animation layer per item. */
+export function applyMotionLayersToItems(assignments: MotionLayerAssignment[]): number {
+  if (assignments.length === 0) return 0
+  return execute(
+    'APPLY_MOTION_LAYERS',
+    () => {
+      const store = useItemsStore.getState()
+      let count = 0
+      for (const { itemId, layer } of assignments) {
+        const item = store.itemById[itemId]
+        if (!item) continue
+        store._updateItem(itemId, { motionLayers: [...(item.motionLayers ?? []), layer] })
+        count += 1
+      }
+      if (count > 0) useTimelineSettingsStore.getState().markDirty()
+      return count
+    },
+    { count: assignments.length },
+  )
+}
+
+/** Remove a named additive layer without touching base keyframes or modifiers. */
+export function removeMotionLayerFromItems(itemIds: string[], layerId: string): number {
+  if (itemIds.length === 0) return 0
+  return execute(
+    'REMOVE_MOTION_LAYER',
+    () => {
+      const store = useItemsStore.getState()
+      let count = 0
+      for (const itemId of itemIds) {
+        const item = store.itemById[itemId]
+        if (!item?.motionLayers?.some((layer) => layer.id === layerId)) continue
+        store._updateItem(itemId, {
+          motionLayers: item.motionLayers.filter((layer) => layer.id !== layerId),
+        })
+        count += 1
+      }
+      if (count > 0) useTimelineSettingsStore.getState().markDirty()
+      return count
+    },
+    { ids: itemIds, layerId },
+  )
 }
 
 function withModifier(
@@ -129,6 +181,8 @@ export interface BakeMotionPlanEntry {
   clearProperties: AnimatableProperty[]
   /** Drop all transform motion modifiers from the item. */
   clearMotionModifiers: boolean
+  /** Drop all non-destructive preset animation layers from the item. */
+  clearMotionLayers: boolean
   /** Effect ids whose audio-pulse modulation should be removed. */
   clearAudioPulseEffectIds: string[]
 }
@@ -179,6 +233,9 @@ export function bakeMotionToKeyframes(plan: BakeMotionPlanEntry[]): number {
           if (entry.clearMotionModifiers) {
             updates.motionModifiers = []
           }
+          if (entry.clearMotionLayers) {
+            updates.motionLayers = []
+          }
           if (entry.clearAudioPulseEffectIds.length > 0 && item.effects) {
             const ids = new Set(entry.clearAudioPulseEffectIds)
             updates.effects = item.effects.map((effect) =>
@@ -208,33 +265,6 @@ export function bakeMotionToKeyframes(plan: BakeMotionPlanEntry[]): number {
 }
 
 /**
- * Attach (or replace) a procedural audio-pulse modulation on a specific effect
- * entry of an item. Single undo entry. Returns true when applied.
- */
-export function setEffectAudioPulse(
-  itemId: string,
-  effectId: string,
-  modulation: AudioPulseModulation,
-): boolean {
-  return execute(
-    'SET_EFFECT_AUDIO_PULSE',
-    () => {
-      const store = useItemsStore.getState()
-      const item = store.itemById[itemId]
-      if (!item?.effects?.some((entry) => entry.id === effectId)) return false
-      store._updateItem(itemId, {
-        effects: item.effects.map((entry) =>
-          entry.id === effectId ? { ...entry, audioPulse: modulation } : entry,
-        ),
-      })
-      useTimelineSettingsStore.getState().markDirty()
-      return true
-    },
-    { itemId, effectId },
-  )
-}
-
-/**
  * Remove a modifier type from each listed item (single undo entry). Returns the
  * number of items that actually had the modifier removed.
  */
@@ -260,5 +290,31 @@ export function removeMotionModifierFromItems(itemIds: string[], type: MotionMod
       return updated
     },
     { count: itemIds.length, type },
+  )
+}
+
+/** Remove live audio-pulse modulation while leaving the visual effect itself intact. */
+export function removeAudioPulseFromItems(itemIds: string[]): number {
+  if (itemIds.length === 0) return 0
+
+  return execute(
+    'REMOVE_AUDIO_PULSE',
+    () => {
+      const store = useItemsStore.getState()
+      let updated = 0
+      for (const itemId of itemIds) {
+        const item = store.itemById[itemId]
+        if (!item?.effects?.some((effect) => effect.audioPulse?.enabled)) continue
+        store._updateItem(itemId, {
+          effects: item.effects.map((effect) =>
+            effect.audioPulse ? { ...effect, audioPulse: undefined } : effect,
+          ),
+        })
+        updated += 1
+      }
+      if (updated > 0) useTimelineSettingsStore.getState().markDirty()
+      return updated
+    },
+    { count: itemIds.length },
   )
 }

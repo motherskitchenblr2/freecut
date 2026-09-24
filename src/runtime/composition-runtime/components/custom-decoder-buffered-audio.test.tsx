@@ -22,6 +22,13 @@ const playbackStateMocks = vi.hoisted(() => ({
     playing: false,
     resolvedVolume: 1,
     resolvedAudioEqStages: [],
+  } as {
+    frame: number
+    fps: number
+    playing: boolean
+    isPreviewScrubbing?: boolean
+    resolvedVolume: number
+    resolvedAudioEqStages: unknown[]
   },
 }))
 
@@ -122,7 +129,7 @@ describe('CustomDecoderBufferedAudio', () => {
     audioDecodeMocks.getOrDecodeAudio.mockReturnValue(pendingDecode)
   })
 
-  it('starts with partial decode playback and continues full decode in background', async () => {
+  it('keeps long preview audio windowed instead of starting a background full decode', async () => {
     vi.useFakeTimers()
     try {
       render(
@@ -155,14 +162,46 @@ describe('CustomDecoderBufferedAudio', () => {
       expect(audioDecodeMocks.getOrDecodeAudio).not.toHaveBeenCalled()
 
       await act(async () => {
-        vi.advanceTimersByTime(1600)
+        vi.advanceTimersByTime(10_000)
         await Promise.resolve()
       })
 
-      expect(audioDecodeMocks.getOrDecodeAudio).toHaveBeenCalledWith('media-1', 'blob:audio')
+      expect(audioDecodeMocks.getOrDecodeAudio).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('does not allocate or decode buffered audio during an active preview scrub', async () => {
+    playbackStateMocks.current.isPreviewScrubbing = true
+
+    const { rerender } = render(
+      <CustomDecoderBufferedAudio
+        src="blob:audio"
+        mediaId="media-1"
+        itemId="item-1"
+        durationInFrames={120}
+      />,
+    )
+
+    await Promise.resolve()
+    expect(audioDecodeMocks.getOrDecodeAudioSliceForPlayback).not.toHaveBeenCalled()
+    expect(audioDecodeMocks.getOrDecodeAudio).not.toHaveBeenCalled()
+
+    playbackStateMocks.current.isPreviewScrubbing = false
+    rerender(
+      <CustomDecoderBufferedAudio
+        src="blob:audio"
+        mediaId="media-1"
+        itemId="item-1"
+        durationInFrames={120}
+        volumeMultiplier={1.01}
+      />,
+    )
+
+    await waitFor(() => {
+      expect(audioDecodeMocks.getOrDecodeAudioSliceForPlayback).toHaveBeenCalled()
+    })
   })
 
   it('prefetches follow-up coverage after a short startup slice', async () => {

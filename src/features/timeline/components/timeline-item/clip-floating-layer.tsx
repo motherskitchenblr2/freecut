@@ -5,7 +5,7 @@ import { TrackPushHandle } from './track-push-handle'
 import { ToolOperationOverlay } from './tool-operation-overlay'
 import { EdgeHalos } from './edge-halos'
 import { TransitionDropGhost } from './transition-drop-ghost'
-import { AnchorDragGhost, FollowerDragGhost } from './drag-ghosts'
+import { FollowerDragGhost } from './drag-ghosts'
 import { DragBlockedTooltip } from './drag-blocked-tooltip'
 import { TranscribeDialogController } from './transcribe-dialog-controller'
 import type { OperationBoundsVisual } from './tool-operation-overlay-utils'
@@ -17,6 +17,7 @@ import type { CaptionDialogState } from './use-caption-dialog-state'
 interface ClipFloatingLayerProps {
   transformRef: RefObject<HTMLDivElement | null>
   ghostRef: RefObject<HTMLDivElement | null>
+  showFollowerDragGhost: boolean
   visualLeftFrame: number
   visualWidthFrames: number
   dragOffset: { x: number; y: number }
@@ -30,8 +31,6 @@ interface ClipFloatingLayerProps {
   toolOperationOverlay: OperationBoundsVisual | null
   activeEdges: ActiveEdgeState | null
   transitionDropGhost: { left: number; width: number; cutOffset: number } | null
-  isAltDrag: boolean
-  isDragging: boolean
   left: number
   width: number
   pointerHint: TimelineItemPointerHint | null
@@ -50,6 +49,7 @@ interface ClipFloatingLayerProps {
 export function ClipFloatingLayer({
   transformRef,
   ghostRef,
+  showFollowerDragGhost,
   visualLeftFrame,
   visualWidthFrames,
   dragOffset,
@@ -63,8 +63,6 @@ export function ClipFloatingLayer({
   toolOperationOverlay,
   activeEdges,
   transitionDropGhost,
-  isAltDrag,
-  isDragging,
   left,
   width,
   pointerHint,
@@ -116,14 +114,7 @@ export function ClipFloatingLayer({
       <TransitionDropGhost ghost={transitionDropGhost} />
 
       {/* Alt-drag ghosts */}
-      <AnchorDragGhost
-        isAltDrag={isAltDrag}
-        isDragging={isDragging}
-        left={left}
-        width={width}
-        dragOffset={dragOffset}
-      />
-      <FollowerDragGhost ref={ghostRef} left={left} width={width} />
+      {showFollowerDragGhost && <FollowerDragGhost ref={ghostRef} left={left} width={width} />}
 
       <DragBlockedTooltip hint={pointerHint} />
       <TranscribeDialogController

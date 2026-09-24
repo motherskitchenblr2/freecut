@@ -26,6 +26,7 @@ import {
   THUMBNAIL_WIDTH,
 } from '@/features/timeline/constants'
 import { filmstripStorage, type FilmstripFrame } from './filmstrip-storage'
+import { fitFilmstripFrameSize } from '../utils/fit-filmstrip-frame-size'
 import { FilmstripMemoryState } from './filmstrip-memory-state'
 import type {
   ExtractRequest,
@@ -106,6 +107,7 @@ interface PendingExtraction {
   totalFrames: number
   progressFrames: number
   targetIndices: number[]
+  phaseTargetIndices: number[]
   targetFrameCount: number | null
   requestedFrameIndices: number[] | null
   unavailableTargetIndices: Set<number>
@@ -739,6 +741,74 @@ class FilmstripCacheService {
     return true
   }
 
+  private mergePriorityRanges(
+    current: PriorityFrameRange | null,
+    next: PriorityFrameRange | null,
+  ): PriorityFrameRange | null {
+    if (!current) return next
+    if (!next) return current
+    return {
+      startIndex: Math.min(current.startIndex, next.startIndex),
+      endIndex: Math.max(current.endIndex, next.endIndex),
+    }
+  }
+
+  private continueExpandedTargetExtraction(
+    pending: PendingExtraction,
+    frames: FilmstripFrame[],
+  ): boolean {
+    if (this.isExactTargetMatch(pending.phaseTargetIndices, pending.targetIndices)) {
+      return false
+    }
+
+    const satisfiedIndices = new Set<number>([
+      ...pending.skipIndices,
+      ...pending.unavailableTargetIndices,
+      ...frames.map((frame) => frame.index),
+    ])
+    const hasMissingExpandedTarget = pending.targetIndices.some(
+      (index) => !satisfiedIndices.has(index),
+    )
+    if (!hasMissingExpandedTarget) {
+      pending.phaseTargetIndices = [...pending.targetIndices]
+      return false
+    }
+
+    // The current phase is complete, so its workers can go back to the pool.
+    // Keep the logical extraction pending and start one follow-up phase for the
+    // append-only target union. This avoids aborting/restarting useful work when
+    // multiple visible splits of the same media request different source frames.
+    if (pending.workers.some((workerState) => !workerState.completed)) {
+      return false
+    }
+    for (const workerState of pending.workers) {
+      this.releaseWorker(workerState.worker)
+    }
+
+    pending.workers = []
+    pending.completedWorkers = 0
+    pending.skipIndices = Array.from(satisfiedIndices).sort((a, b) => a - b)
+    pending.phaseTargetIndices = [...pending.targetIndices]
+
+    const satisfiedTargetCount = pending.targetIndices.reduce(
+      (count, index) => (satisfiedIndices.has(index) ? count + 1 : count),
+      0,
+    )
+    const progress = Math.min(
+      99,
+      Math.round((satisfiedTargetCount / Math.max(1, pending.targetIndices.length)) * 100),
+    )
+    this.notifyUpdate(pending.mediaId, {
+      frames,
+      isComplete: false,
+      isExtracting: true,
+      progress,
+    })
+    pending.onProgress?.(progress)
+    this.startPendingExtraction(pending.mediaId)
+    return true
+  }
+
   private buildSettledFilmstrip(pending: PendingExtraction, frames: FilmstripFrame[]): Filmstrip {
     const completionTargetIndices = this.getCompletionTargetIndices(pending)
     const completionTargetSet = new Set(completionTargetIndices)
@@ -1076,6 +1146,12 @@ class FilmstripCacheService {
       const nextOnProgress = onProgress ?? pending.onProgress
       const targetCountChanged =
         nextTargetFrameIndices.length === 0 && pending.targetFrameCount !== nextTargetFrameCount
+      const canMergeExactTargets =
+        pending.blobUrl === blobUrl &&
+        pending.totalFrames === nextTotalFrames &&
+        pending.priorityOnly === nextPriorityOnly &&
+        pending.requestedFrameIndices !== null &&
+        nextTargetFrameIndices.length > 0
       const needsRestart =
         pending.blobUrl !== blobUrl ||
         pending.totalFrames !== nextTotalFrames ||
@@ -1084,7 +1160,53 @@ class FilmstripCacheService {
         !this.isExactTargetMatch(pending.requestedFrameIndices ?? [], nextTargetFrameIndices) ||
         !this.isExactTargetMatch(pending.targetIndices, nextTargetIndices)
 
-      if (needsRestart) {
+      if (needsRestart && canMergeExactTargets) {
+        const previousTargetSet = new Set(pending.targetIndices)
+        const mergedTargetIndices = this.normalizeTargetFrameIndices(nextTotalFrames, [
+          ...pending.targetIndices,
+          ...nextTargetIndices,
+        ])
+        const mergedPriorityRange = this.mergePriorityRanges(
+          pending.priorityRange,
+          nextPriorityRange,
+        )
+        const alreadySatisfied = new Set<number>([
+          ...pending.skipIndices,
+          ...pending.extractedFrames.keys(),
+          ...pending.unavailableTargetIndices,
+        ])
+        const addedTargetIndices = mergedTargetIndices.filter(
+          (index) => !previousTargetSet.has(index),
+        )
+
+        pending.targetIndices = mergedTargetIndices
+        pending.requestedFrameIndices = mergedTargetIndices
+        pending.targetFrameCount = null
+        pending.priorityRange = mergedPriorityRange
+        pending.persistCompleteToStorage = false
+        pending.progressFrames = Math.max(1, mergedTargetIndices.length)
+        pending.onProgress = nextOnProgress
+        pending.metrics.targetFrames = mergedTargetIndices.length
+        pending.metrics.existingTargetFrames += addedTargetIndices.reduce(
+          (count, index) => (alreadySatisfied.has(index) ? count + 1 : count),
+          0,
+        )
+        pending.metrics.framesToExtract += addedTargetIndices.reduce(
+          (count, index) => (alreadySatisfied.has(index) ? count : count + 1),
+          0,
+        )
+        pending.metrics.priorityFrames = this.buildPriorityIndices(
+          nextTotalFrames,
+          mergedPriorityRange,
+        ).length
+
+        // A queued extraction has not dispatched its phase targets yet, so it
+        // can absorb the union directly without needing a follow-up phase.
+        if (!this.activeExtractions.has(mediaId) && pending.workers.length === 0) {
+          pending.phaseTargetIndices = [...mergedTargetIndices]
+          this.extractionQueue.sort((a, b) => this.getQueueScore(a) - this.getQueueScore(b))
+        }
+      } else if (needsRestart) {
         const currentFrames = Array.from(pending.extractedFrames.values()).sort(
           (a, b) => a.index - b.index,
         )
@@ -1310,6 +1432,7 @@ class FilmstripCacheService {
       totalFrames,
       progressFrames: Math.max(1, targetIndices.length),
       targetIndices,
+      phaseTargetIndices: [...targetIndices],
       targetFrameCount: normalizedTargetFrameCount,
       requestedFrameIndices:
         normalizedTargetFrameIndices.length > 0 ? normalizedTargetFrameIndices : null,
@@ -1520,10 +1643,10 @@ class FilmstripCacheService {
       skipIndices,
       forceSingleWorker,
       progressFrames,
-      targetIndices,
+      phaseTargetIndices,
     } = pending
     const skipSet = new Set(skipIndices)
-    const framesToExtract = targetIndices.reduce(
+    const framesToExtract = phaseTargetIndices.reduce(
       (count, index) => (skipSet.has(index) ? count : count + 1),
       0,
     )
@@ -1547,7 +1670,7 @@ class FilmstripCacheService {
       Math.max(1, Math.floor(framesToExtract / MIN_FRAMES_PER_WORKER)),
     )
 
-    const sortedTargetIndices = [...targetIndices].sort((a, b) => a - b)
+    const sortedTargetIndices = [...phaseTargetIndices].sort((a, b) => a - b)
     const effectiveWorkerCount = Math.min(workerCount, Math.max(1, sortedTargetIndices.length))
     const targetsPerWorker = Math.ceil(sortedTargetIndices.length / effectiveWorkerCount)
     pending.metrics.workerCount = effectiveWorkerCount
@@ -1701,10 +1824,13 @@ class FilmstripCacheService {
           if (pending.completedWorkers === pending.workers.length) {
             // All workers done - finalize directly from in-memory extracted frames
             // to avoid an extra full storage scan and URL recreation pass.
-            const finalFrames = Array.from(pending.extractedFrames.values()).sort(
+            let finalFrames = Array.from(pending.extractedFrames.values()).sort(
               (a, b) => a.index - b.index,
             )
-            const settled = this.buildSettledFilmstrip(pending, finalFrames)
+            if (this.continueExpandedTargetExtraction(pending, finalFrames)) {
+              return
+            }
+            let settled = this.buildSettledFilmstrip(pending, finalFrames)
             try {
               await filmstripStorage.saveMetadata(mediaId, {
                 width: FILMSTRIP_EXTRACT_WIDTH,
@@ -1715,6 +1841,21 @@ class FilmstripCacheService {
             } catch (metadataError) {
               logger.warn(`Failed to persist completion metadata for ${mediaId}:`, metadataError)
             }
+
+            // A compatible exact-index request may have arrived while the
+            // metadata write yielded. Re-read the live pending state before
+            // publishing a settled result so that request joins this logical
+            // extraction instead of being dropped.
+            if (this.pendingExtractions.get(mediaId) !== pending) {
+              return
+            }
+            finalFrames = Array.from(pending.extractedFrames.values()).sort(
+              (a, b) => a.index - b.index,
+            )
+            if (this.continueExpandedTargetExtraction(pending, finalFrames)) {
+              return
+            }
+            settled = this.buildSettledFilmstrip(pending, finalFrames)
             this.notifyUpdate(mediaId, settled)
             pending.onProgress?.(settled.progress)
             this.finalizeExtractionMetrics(pending.metrics, 'completed', finalFrames.length)
@@ -1977,6 +2118,7 @@ class FilmstripCacheService {
       totalFrames,
       progressFrames: Math.max(1, targetIndices.length),
       targetIndices,
+      phaseTargetIndices: [...targetIndices],
       targetFrameCount: normalizedTargetFrameCount,
       requestedFrameIndices:
         normalizedTargetFrameIndices.length > 0 ? normalizedTargetFrameIndices : null,
@@ -2032,15 +2174,21 @@ class FilmstripCacheService {
       })
 
       const canvas = document.createElement('canvas')
-      canvas.width = FILMSTRIP_EXTRACT_WIDTH
-      canvas.height = FILMSTRIP_EXTRACT_HEIGHT
+      const frameSize = fitFilmstripFrameSize(
+        video.videoWidth,
+        video.videoHeight,
+        FILMSTRIP_EXTRACT_WIDTH,
+        FILMSTRIP_EXTRACT_HEIGHT,
+      )
+      canvas.width = frameSize.width
+      canvas.height = frameSize.height
       const ctx = canvas.getContext('2d')
       if (!ctx) {
         throw new Error('Failed to create canvas context for filmstrip fallback')
       }
 
       const totalFrames = pending.totalFrames
-      const targetIndices = pending.targetIndices
+      const targetIndices = pending.phaseTargetIndices
       const targetSet = new Set(targetIndices)
       const skipSet = new Set<number>()
       for (const index of pending.skipIndices) {
@@ -2081,7 +2229,8 @@ class FilmstripCacheService {
         const targetTime = Math.min(i / FRAME_RATE, maxSeekTime)
 
         await this.seekVideo(video, targetTime)
-        this.drawCoverFrame(video, ctx, canvas.width, canvas.height)
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
 
         const blob = await this.canvasToBlob(canvas)
         await filmstripStorage.saveFrameBlob(mediaId, i, blob)
@@ -2118,16 +2267,30 @@ class FilmstripCacheService {
         return
       }
 
-      const finalFrames = Array.from(finishedPending.extractedFrames.values()).sort(
+      let finalFrames = Array.from(finishedPending.extractedFrames.values()).sort(
         (a, b) => a.index - b.index,
       )
-      const settled = this.buildSettledFilmstrip(finishedPending, finalFrames)
+      if (this.continueExpandedTargetExtraction(finishedPending, finalFrames)) {
+        return
+      }
+      let settled = this.buildSettledFilmstrip(finishedPending, finalFrames)
       await filmstripStorage.saveMetadata(mediaId, {
         width: FILMSTRIP_EXTRACT_WIDTH,
         height: FILMSTRIP_EXTRACT_HEIGHT,
         isComplete: settled.isComplete && this.shouldPersistCompletionMetadata(finishedPending),
         frameCount: finishedPending.extractedFrames.size,
       })
+
+      if (this.pendingExtractions.get(mediaId) !== finishedPending) {
+        return
+      }
+      finalFrames = Array.from(finishedPending.extractedFrames.values()).sort(
+        (a, b) => a.index - b.index,
+      )
+      if (this.continueExpandedTargetExtraction(finishedPending, finalFrames)) {
+        return
+      }
+      settled = this.buildSettledFilmstrip(finishedPending, finalFrames)
 
       this.notifyUpdate(mediaId, settled)
       finishedPending.onProgress?.(settled.progress)
@@ -2183,37 +2346,6 @@ class FilmstripCacheService {
       video.addEventListener('error', onError, { once: true })
       video.currentTime = clamped
     })
-  }
-
-  private drawCoverFrame(
-    video: HTMLVideoElement,
-    ctx: CanvasRenderingContext2D,
-    targetWidth: number,
-    targetHeight: number,
-  ): void {
-    const sourceWidth = video.videoWidth || targetWidth
-    const sourceHeight = video.videoHeight || targetHeight
-
-    const sourceAspect = sourceWidth / sourceHeight
-    const targetAspect = targetWidth / targetHeight
-
-    let drawWidth = targetWidth
-    let drawHeight = targetHeight
-    let offsetX = 0
-    let offsetY = 0
-
-    if (sourceAspect > targetAspect) {
-      drawHeight = targetHeight
-      drawWidth = drawHeight * sourceAspect
-      offsetX = (targetWidth - drawWidth) / 2
-    } else {
-      drawWidth = targetWidth
-      drawHeight = drawWidth / sourceAspect
-      offsetY = (targetHeight - drawHeight) / 2
-    }
-
-    ctx.clearRect(0, 0, targetWidth, targetHeight)
-    ctx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight)
   }
 
   private canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {

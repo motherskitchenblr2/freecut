@@ -1,4 +1,4 @@
-import { createElement } from 'react'
+import { createElement, startTransition, Suspense } from 'react'
 import { act, render, screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 
@@ -88,7 +88,7 @@ describe('useClipVisibility', () => {
     expect(screen.getByTestId('visibility')).toHaveTextContent('false:0.000:1.000')
   })
 
-  it('forces visible during zoom interaction to avoid coordinate space mismatch', () => {
+  it('freezes the last bounded visibility window during zoom interaction', () => {
     render(
       createElement(VisibilityProbe, {
         clipLeftPx: 200,
@@ -110,10 +110,115 @@ describe('useClipVisibility', () => {
     })
     expect(screen.getByTestId('visibility')).toHaveTextContent('false:0.000:1.000')
 
-    // Start zoom interaction — should force visible
+    // Start zoom interaction. The last valid offscreen state remains frozen.
     act(() => {
       useZoomStore.getState().setZoomLevelImmediate(2)
     })
+    expect(screen.getByTestId('visibility')).toHaveTextContent('false:0.000:1.000')
+
+    // Viewport changes during the gesture do not expand or move the window.
+    act(() => {
+      useTimelineViewportStore.getState().setViewport({
+        scrollLeft: 0,
+        scrollTop: 0,
+        viewportWidth: 800,
+        viewportHeight: 120,
+      })
+    })
+    expect(screen.getByTestId('visibility')).toHaveTextContent('false:0.000:1.000')
+
+    // Settling zoom recomputes against the current viewport.
+    act(() => {
+      useZoomStore.getState().setZoomLevelSynchronized(2)
+    })
     expect(screen.getByTestId('visibility')).toHaveTextContent('true:0.000:1.000')
+  })
+
+  it('does not leak visibility from a suspended geometry transition', async () => {
+    useTimelineViewportStore.getState().setViewport({
+      scrollLeft: 5000,
+      scrollTop: 0,
+      viewportWidth: 900,
+      viewportHeight: 120,
+    })
+
+    let allowSuspendedRender = false
+    let releaseSuspendedRender: (() => void) | null = null
+    const suspendedRender = new Promise<void>((resolve) => {
+      releaseSuspendedRender = () => {
+        allowSuspendedRender = true
+        resolve()
+      }
+    })
+
+    function ConcurrentVisibilityProbe({
+      clipLeftPx,
+      geometryPixelsPerSecond,
+      suspendWhenVisible = false,
+    }: {
+      clipLeftPx: number
+      geometryPixelsPerSecond: number
+      suspendWhenVisible?: boolean
+    }) {
+      const visibility = useClipVisibility(clipLeftPx, 400, geometryPixelsPerSecond)
+      if (suspendWhenVisible && visibility.isVisible && !allowSuspendedRender) {
+        throw suspendedRender
+      }
+      return createElement(
+        'div',
+        { 'data-testid': 'concurrent-visibility' },
+        String(visibility.isVisible),
+      )
+    }
+
+    const createTree = (
+      clipLeftPx: number,
+      geometryPixelsPerSecond: number,
+      suspendWhenVisible = false,
+    ) =>
+      createElement(
+        Suspense,
+        {
+          fallback: createElement('div', { 'data-testid': 'concurrent-visibility' }, 'loading'),
+        },
+        createElement(ConcurrentVisibilityProbe, {
+          clipLeftPx,
+          geometryPixelsPerSecond,
+          suspendWhenVisible,
+        }),
+      )
+
+    const view = render(createTree(200, 100))
+    expect(screen.getByTestId('concurrent-visibility')).toHaveTextContent('false')
+
+    act(() => {
+      useZoomStore.setState({
+        contentLevel: 2,
+        contentPixelsPerSecond: 200,
+      })
+      startTransition(() => {
+        view.rerender(createTree(5000, 200, true))
+      })
+    })
+    expect(screen.getByTestId('concurrent-visibility')).toHaveTextContent('false')
+
+    act(() => {
+      useZoomStore.setState({ isZoomInteracting: true })
+      useTimelineViewportStore.getState().setViewport({
+        scrollLeft: 5000,
+        scrollTop: 0,
+        viewportWidth: 901,
+        viewportHeight: 120,
+      })
+    })
+    expect(screen.getByTestId('concurrent-visibility')).toHaveTextContent('false')
+
+    act(() => {
+      view.rerender(createTree(200, 100))
+    })
+    await act(async () => {
+      releaseSuspendedRender?.()
+      await suspendedRender
+    })
   })
 })

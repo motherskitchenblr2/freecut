@@ -258,6 +258,7 @@
       "heroSubtitle": "Edición de video profesional, cero instalación. Crea contenido impresionante en tu navegador.",
       "disclaimer": "⚠️ AVISO: Esto está muy en beta y puede tener errores. Espero que aun así disfrutes la experiencia.",
       "getStarted": "Empezar",
+      "viewChangelog": "Novedades",
       "starOnGitHub": "Dale una estrella en GitHub",
       "showcaseHeading": "Capacidades de edición con muchas funciones",
       "showcaseSubheading": "Un conjunto completo de edición de video, directamente en tu navegador.",
@@ -277,17 +278,33 @@
           "title": "Edición en la línea de tiempo",
           "description": "Edición multipista con video, audio, texto y formas"
         },
-        "keyframe": {
-          "title": "Editor de fotogramas clave sencillo",
-          "description": "Animación de fotogramas clave intuitiva para transiciones suaves"
+        "motion": {
+          "title": "Espacio de movimiento",
+          "description": "Crea animaciones por capas con tiempos precisos y curvas reutilizables"
         },
-        "projects": {
-          "title": "Gestión de proyectos",
-          "description": "Crea, organiza y gestiona tus proyectos"
+        "colorGrade": {
+          "title": "Gradación de color",
+          "description": "Ajusta el color con ruedas, curvas, osciloscopios y capas de ajuste"
+        },
+        "keyframe": {
+          "title": "Editor de fotogramas clave",
+          "description": "Ajusta el movimiento con precisión en la vista de gráfica o exposición"
+        },
+        "semantic": {
+          "title": "Búsqueda semántica de escenas",
+          "description": "Encuentra el momento adecuado buscando lo que ocurre en pantalla"
         },
         "export": {
           "title": "Exporta en la web",
           "description": "Renderiza tus videos localmente con tu navegador."
+        },
+        "audioEq": {
+          "title": "Ecualización y mezcla de audio",
+          "description": "Ajusta el audio de clips y pistas con controles visuales"
+        },
+        "hotkeys": {
+          "title": "Atajos de teclado personalizados",
+          "description": "Revisa, reasigna, importa y exporta tus atajos de edición"
         }
       },
       "faq": {
@@ -473,6 +490,12 @@
           "clearKeyframes": "Borrar todos los fotogramas clave de los elementos seleccionados",
           "keyframeEditorGraph": "Cambiar el editor de fotogramas clave a la vista de gráfico",
           "keyframeEditorDopesheet": "Cambiar el editor de fotogramas clave a la vista de hoja de tiempos",
+          "keyframeEditorSplit": "Cambiar el editor de fotogramas clave a la vista dividida",
+          "editKeyframeAdd": "Añadir fotograma clave en el cabezal para la capa de Edit seleccionada",
+          "keyframePrevious": "Ir al fotograma clave anterior de la propiedad",
+          "keyframeNext": "Ir al fotograma clave siguiente de la propiedad",
+          "keyframeToggleAuto": "Alternar clave automática para la propiedad activa",
+          "keyframeFit": "Ajustar los fotogramas clave seleccionados a la vista",
           "markIn": "Marcar punto de entrada",
           "markOut": "Marcar punto de salida",
           "clearInOut": "Borrar puntos de entrada/salida",
@@ -535,6 +558,13 @@
     "routeError": {
       "title": "Algo salió mal",
       "description": "FreeCut no pudo terminar de cargar esta página.",
+      "projectNotFoundTitle": "No encontramos este proyecto",
+      "projectNotFoundDescription": "Puede que se haya movido, eliminado o abierto desde un enlace antiguo. Tus demás proyectos siguen disponibles en tu espacio de trabajo.",
+      "backToProjects": "Volver a proyectos",
+      "supportHint": "Si necesitas ayuda, copia los detalles del error y envíaselos a un desarrollador.",
+      "copyDetails": "Copiar detalles del error",
+      "detailsCopied": "Detalles del error copiados",
+      "copyFailed": "No se pudieron copiar los detalles",
       "causePermission": "FreeCut ya no tiene permiso para usar tu carpeta de trabajo. Vuelve a conectarla o elige otra carpeta.",
       "causeMissing": "No se encontró tu carpeta de trabajo. Puede que se haya movido, renombrado o eliminado.",
       "causeUnsupported": "Tu carpeta de trabajo está en una unidad que no admite todo lo que FreeCut necesita. Las carpetas sincronizadas en la nube y las de red suelen comportarse así. Elegir una carpeta en un disco local suele solucionarlo."

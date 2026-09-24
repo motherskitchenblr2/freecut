@@ -50,7 +50,7 @@ function DragVisualHarness({
           opacity: dragVisualState.shouldDimForDrag ? String(DRAG_OPACITY) : initialOpacity,
         }}
       />
-      <div data-testid="ghost" ref={ghostRef} />
+      {dragVisualState.isAltDrag && <div data-testid="ghost" ref={ghostRef} />}
       <div data-testid="join-state">
         {String(dragVisualState.dragAffectsJoin.left)}:
         {String(dragVisualState.dragAffectsJoin.right)}
@@ -107,6 +107,7 @@ describe('useDragVisualState', () => {
     const item = makeVideoItem()
     render(<DragVisualHarness item={item} initialOpacity="0.3" />)
 
+    expect(screen.queryByTestId('ghost')).not.toBeInTheDocument()
     await waitFor(() => {
       expect(screen.getByTestId('body').style.opacity).toBe('0.3')
     })
@@ -120,6 +121,7 @@ describe('useDragVisualState', () => {
     setDragState([item.id])
 
     const body = screen.getByTestId('body')
+    expect(screen.queryByTestId('ghost')).not.toBeInTheDocument()
     await waitFor(() => {
       expect(body.style.transform).toBe('translate(18px, 6px)')
       expect(body.style.opacity).toBe(String(DRAG_OPACITY))
@@ -146,9 +148,9 @@ describe('useDragVisualState', () => {
     dragPreviewOffsetByItemRef.current = {
       [item.id]: { x: 11, y: 7 },
     }
+    const body = screen.getByTestId('body')
     setDragState([item.id], true)
 
-    const body = screen.getByTestId('body')
     const ghost = screen.getByTestId('ghost')
     await waitFor(() => {
       expect(body.style.transform).toBe('')
@@ -156,6 +158,62 @@ describe('useDragVisualState', () => {
       expect(body.style.pointerEvents).toBe('none')
       expect(ghost.style.display).toBe('block')
       expect(ghost.style.transform).toBe('translate(11px, 7px)')
+    })
+
+    act(() => {
+      useSelectionStore.getState().setDragState(null)
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('ghost')).not.toBeInTheDocument()
+      expect(screen.getByTestId('body')).toBe(body)
+    })
+  })
+
+  it('drives the anchor and follower alt-drag ghosts from the same preview offsets', async () => {
+    const anchor = makeVideoItem({ id: 'anchor', from: 20 })
+    const follower = makeVideoItem({ id: 'follower', from: 80 })
+    render(
+      <>
+        <DragVisualHarness item={anchor} isDragging />
+        <DragVisualHarness item={follower} />
+      </>,
+    )
+    const bodies = screen.getAllByTestId('body')
+    expect(screen.queryAllByTestId('ghost')).toHaveLength(0)
+
+    dragPreviewOffsetByItemRef.current = {
+      [anchor.id]: { x: 14, y: 3 },
+      [follower.id]: { x: 14, y: 3 },
+    }
+    setDragState([anchor.id, follower.id], true)
+
+    const ghosts = screen.getAllByTestId('ghost')
+    await waitFor(() => {
+      expect(ghosts[0]?.style.display).toBe('block')
+      expect(ghosts[0]?.style.transform).toBe('translate(14px, 3px)')
+      expect(ghosts[1]?.style.display).toBe('block')
+      expect(ghosts[1]?.style.transform).toBe('translate(14px, 3px)')
+    })
+
+    dragPreviewOffsetByItemRef.current = {
+      [anchor.id]: { x: 38, y: 9 },
+      [follower.id]: { x: 38, y: 9 },
+    }
+
+    await waitFor(() => {
+      expect(ghosts[0]?.style.transform).toBe('translate(38px, 9px)')
+      expect(ghosts[1]?.style.transform).toBe('translate(38px, 9px)')
+    })
+
+    act(() => {
+      useSelectionStore.getState().setDragState(null)
+    })
+
+    await waitFor(() => {
+      expect(screen.queryAllByTestId('ghost')).toHaveLength(0)
+      expect(screen.getAllByTestId('body')[0]).toBe(bodies[0])
+      expect(screen.getAllByTestId('body')[1]).toBe(bodies[1])
     })
   })
 

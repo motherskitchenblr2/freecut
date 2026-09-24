@@ -44,6 +44,8 @@ import { canLinkSelection, hasLinkedItems } from '../../utils/linked-items'
 import {
   getSceneVerificationModelLabel,
   importSceneDetection,
+  SCENE_DETECTOR_VERSION,
+  type SceneDetectionMethod,
   type VerificationModel,
 } from '../../deps/analysis'
 import { resolveMediaUrl } from '../../deps/media-library-resolver'
@@ -55,10 +57,56 @@ import {
   applyFillerPreviewOverlays,
   DEFAULT_FILLER_REMOVAL_SETTINGS,
 } from '../../utils/filler-word-removal-preview'
+import { mapSceneCutTimesToTimelineFrames } from '../../utils/scene-cut-frames'
 
 const logger = createLogger('UseTimelineItemActions')
 
 const SCENE_DETECTION_OVERLAY_ID = 'scene-detection'
+
+interface SelectionCapabilities {
+  canJoin: boolean
+  canLink: boolean
+  canUnlink: boolean
+}
+
+let cachedSelectionIds: string[] | null = null
+let cachedSelectionItems: TimelineItemType[] | null = null
+let cachedSelectionCapabilities: SelectionCapabilities = {
+  canJoin: false,
+  canLink: false,
+  canUnlink: false,
+}
+
+/**
+ * Context-menu capabilities are selection-wide, but every mounted clip renders
+ * its own menu trigger. Cache the shared calculation by the stable Zustand
+ * array references so a multi-select drag does the work once instead of once
+ * per selected clip on both drag start and drag end.
+ */
+function getSelectionCapabilities(): SelectionCapabilities {
+  const selectedItemIds = useSelectionStore.getState().selectedItemIds
+  const itemsState = useItemsStore.getState()
+  const items = itemsState.items
+
+  if (selectedItemIds === cachedSelectionIds && items === cachedSelectionItems) {
+    return cachedSelectionCapabilities
+  }
+
+  const selectedItems = selectedItemIds
+    .map((id) => itemsState.itemById[id])
+    .filter((candidate): candidate is TimelineItemType => candidate !== undefined)
+
+  cachedSelectionIds = selectedItemIds
+  cachedSelectionItems = items
+  cachedSelectionCapabilities = {
+    canJoin: selectedItems.length >= 2 && canJoinMultipleItems(selectedItems),
+    canLink: selectedItemIds.length >= 2 && canLinkSelection(items, selectedItemIds),
+    canUnlink:
+      selectedItemIds.length > 0 && selectedItemIds.some((id) => hasLinkedItems(items, id)),
+  }
+
+  return cachedSelectionCapabilities
+}
 
 interface UseTimelineItemActionsParams {
   item: TimelineItemType
@@ -75,38 +123,11 @@ export function useTimelineItemActions({
   rightNeighbor,
   segmentOverlays,
 }: UseTimelineItemActionsParams) {
-  const getCanJoinSelected = useCallback(() => {
-    const selectedItemIds = useSelectionStore.getState().selectedItemIds
-    if (selectedItemIds.length < 2) {
-      return false
-    }
+  const getCanJoinSelected = useCallback(() => getSelectionCapabilities().canJoin, [])
 
-    const items = useTimelineStore.getState().items
-    const selectedItems = selectedItemIds
-      .map((id) => items.find((candidate) => candidate.id === id))
-      .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined)
-    return canJoinMultipleItems(selectedItems)
-  }, [])
+  const getCanLinkSelected = useCallback(() => getSelectionCapabilities().canLink, [])
 
-  const getCanLinkSelected = useCallback(() => {
-    const selectedItemIds = useSelectionStore.getState().selectedItemIds
-    if (selectedItemIds.length < 2) {
-      return false
-    }
-
-    const items = useTimelineStore.getState().items
-    return canLinkSelection(items, selectedItemIds)
-  }, [])
-
-  const getCanUnlinkSelected = useCallback(() => {
-    const selectedItemIds = useSelectionStore.getState().selectedItemIds
-    if (selectedItemIds.length === 0) {
-      return false
-    }
-
-    const items = useTimelineStore.getState().items
-    return selectedItemIds.some((id) => hasLinkedItems(items, id))
-  }, [])
+  const getCanUnlinkSelected = useCallback(() => getSelectionCapabilities().canUnlink, [])
 
   const handleJoinSelected = useCallback(() => {
     const selectedItemIds = useSelectionStore.getState().selectedItemIds
@@ -347,7 +368,7 @@ export function useTimelineItemActions({
   }, [])
 
   const handleDetectScenes = useCallback(
-    (method: 'histogram' | 'optical-flow', verificationModel?: VerificationModel) => {
+    (method: SceneDetectionMethod, verificationModel?: VerificationModel) => {
       if (item.type !== 'video' || !item.mediaId || isBroken) {
         return
       }
@@ -399,21 +420,23 @@ export function useTimelineItemActions({
           const media = useMediaLibraryStore.getState().mediaById[mediaId]
           const mediaFps = media?.fps ?? currentFps
           const { detectScenes } = await importSceneDetection()
-          const cuts = await detectScenes(video, currentFps, {
+          const cuts = await detectScenes(video, {
             method,
             verificationModel,
             mediaId,
+            sourceFps: mediaFps,
             signal: abortController.signal,
             onProgress: (progress) => {
               const modelLabel = progress.verificationModel
                 ? getSceneVerificationModelLabel(progress.verificationModel)
                 : 'AI'
               const stageLabels = {
-                'optical-flow': `Analyzing ${method === 'histogram' ? 'frames' : 'motion'} (${progress.sceneCuts} candidates)`,
+                analyzing: `Analyzing frames (${progress.sceneCuts} candidates)`,
+                classifying: `Classifying cuts (${progress.sceneCuts} candidates)`,
                 'loading-model': `Loading ${modelLabel} model (${progress.percent.toFixed(0)}%)`,
-                verifying: `Verifying cuts (${progress.sceneCuts}/${progress.totalSamples} confirmed)`,
+                verifying: `Verifying cuts (${progress.sceneCuts}/${progress.total} confirmed)`,
               }
-              const label = stageLabels[progress.stage ?? 'optical-flow']
+              const label = stageLabels[progress.stage]
               useTimelineItemOverlayStore.getState().upsertOverlay(clipId, {
                 id: SCENE_DETECTION_OVERLAY_ID,
                 label,
@@ -428,13 +451,12 @@ export function useTimelineItemActions({
           if (cuts.length > 0) {
             void saveScenes({
               mediaId,
-              service:
-                method === 'histogram' ? 'scene-detect-histogram' : 'scene-detect-optical-flow',
+              service: method === 'histogram' ? 'scene-detect-histogram' : 'scene-detect-adaptive',
               model: verificationModel ?? method,
               method,
-              sampleIntervalMs: method === 'histogram' ? 250 : 500,
+              detectorVersion: SCENE_DETECTOR_VERSION,
+              sampleIntervalMs: method === 'histogram' ? 250 : undefined,
               verificationModel,
-              fps: mediaFps,
               cuts,
             }).catch((error) => logger.warn('Failed to persist scene cuts', error))
           }
@@ -445,13 +467,15 @@ export function useTimelineItemActions({
           }
 
           const clipDuration = item.durationInFrames
-          // sourceStart is in source-native FPS; convert to project FPS for consistent math
+          // Source trims use native FPS; scene boundaries are persisted as source time.
           const sourceStartSeconds = (sourceStart ?? 0) / mediaFps
-          const sourceStartInProjectFrames = Math.round(sourceStartSeconds * currentFps)
-          const splitFrames = cuts
-            .map((cut) => cut.frame - sourceStartInProjectFrames)
-            .filter((frame) => frame > 0 && frame < clipDuration)
-            .map((frame) => frame + clipFrom)
+          const splitFrames = mapSceneCutTimesToTimelineFrames({
+            cuts,
+            sourceStartSeconds,
+            projectFps: currentFps,
+            clipFrom,
+            clipDurationInFrames: clipDuration,
+          })
 
           if (splitFrames.length === 0) {
             toast.info(i18n.t('timeline.sceneDetection.noScenesWithinBounds'))
@@ -469,11 +493,7 @@ export function useTimelineItemActions({
           if (error instanceof DOMException && error.name === 'AbortError') {
             return
           }
-          if (error instanceof Error && error.message.includes('WebGPU')) {
-            toast.error(i18n.t('timeline.sceneDetection.requiresWebGpu'))
-          } else {
-            toast.error(i18n.t('timeline.sceneDetection.failed'))
-          }
+          toast.error(i18n.t('timeline.sceneDetection.failed'))
         } finally {
           if (video) {
             video.onloadedmetadata = null

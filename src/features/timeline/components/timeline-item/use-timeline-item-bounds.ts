@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import type { TimelineItem as TimelineItemType } from '@/types/timeline'
 import { frameToPixelsNow } from '../../utils/zoom-conversions'
-import { timelineToSourceFrames } from '../../utils/source-calculations'
+import { isMediaItem, timelineToSourceFrames } from '../../utils/source-calculations'
 import { computeSlideContinuitySourceDelta } from '../../utils/slide-utils'
 
 interface RateStretchVisualFeedback {
@@ -9,8 +9,6 @@ interface RateStretchVisualFeedback {
   duration: number
   speed: number
 }
-
-const COMPACT_CLIP_MAX_WIDTH_PX = 36
 
 interface UseTimelineItemBoundsParams {
   previewBaseItem: TimelineItemType
@@ -52,7 +50,6 @@ export interface TimelineItemBounds {
   visualWidthFrames: number
   visualLeft: number
   visualWidth: number
-  isCompactWidth: boolean
   slideFromOffset: number
   slideDurationOffset: number
   contentPreviewItem: TimelineItemType
@@ -136,7 +133,7 @@ export function useTimelineItemBounds({
       }
     }
 
-    if ((nextItem.type === 'video' || nextItem.type === 'audio') && slideEditOffset !== 0) {
+    if (isMediaItem(nextItem) && slideEditOffset !== 0) {
       const sourceDelta = computeSlideContinuitySourceDelta(
         nextItem,
         slideLeftNeighborForSlidItem,
@@ -153,10 +150,7 @@ export function useTimelineItemBounds({
       }
     }
 
-    if (
-      (previewBaseItem.type === 'video' || previewBaseItem.type === 'audio') &&
-      slipEditDelta !== 0
-    ) {
+    if (isMediaItem(previewBaseItem) && slipEditDelta !== 0) {
       const nextSourceStart = Math.max(0, (nextItem.sourceStart ?? 0) + slipEditDelta)
       const nextSourceEnd =
         nextItem.sourceEnd !== undefined
@@ -303,8 +297,6 @@ export function useTimelineItemBounds({
 
   const visualLeft = Math.round(frameToPixelsNow(visualLeftFrame))
   const visualWidth = Math.round(frameToPixelsNow(visualWidthFrames))
-  const isCompactWidth = visualWidth > 0 && visualWidth <= COMPACT_CLIP_MAX_WIDTH_PX
-
   return {
     leftFrame,
     rightFrame,
@@ -315,7 +307,6 @@ export function useTimelineItemBounds({
     visualWidthFrames,
     visualLeft,
     visualWidth,
-    isCompactWidth,
     slideFromOffset,
     slideDurationOffset,
     contentPreviewItem,

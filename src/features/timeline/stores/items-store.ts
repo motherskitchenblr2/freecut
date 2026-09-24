@@ -18,6 +18,7 @@ import {
 } from '../utils/source-calculations'
 import { isCompositionWrapperItem, wouldCreateCompositionCycle } from '../utils/composition-graph'
 import { normalizeClassicTrackNames } from '../utils/classic-tracks'
+import { pruneEmptyLayerGroups } from '../utils/group-utils'
 import { resolveTrackHeight } from '../utils/track-heights'
 import { getActiveCompositionId } from './composition-navigation-active'
 import { useCompositionsStore } from './compositions-store'
@@ -102,7 +103,10 @@ interface ItemsActions {
   _updateItemTransform: (id: string, transform: Partial<TransformProperties>) => void
   _resetItemTransform: (id: string) => void
   _updateItemsTransform: (ids: string[], transform: Partial<TransformProperties>) => void
-  _updateItemsTransformMap: (transformsMap: Map<string, Partial<TransformProperties>>) => void
+  _updateItemsTransformMap: (
+    transformsMap: Map<string, Partial<TransformProperties>>,
+    itemUpdates?: ReadonlyMap<string, Partial<TimelineItem>>,
+  ) => void
 
   // Effect operations
   _addEffect: (itemId: string, effect: VisualEffect) => void
@@ -162,7 +166,7 @@ export const useItemsStore = create<ItemsState & ItemsActions>()((set, get) => (
       // passes the existing stored object, normalization is a no-op re-clone, so
       // reuse the previous reference.
       const previousById = new Map(state.tracks.map((track) => [track.id, track]))
-      const sortedTracks = tracks
+      const sortedTracks = pruneEmptyLayerGroups(tracks)
         .map((track) => {
           const previous = previousById.get(track.id)
           const normalized = previous === track ? previous : normalizeTrack(track)
@@ -318,6 +322,7 @@ export const useItemsStore = create<ItemsState & ItemsActions>()((set, get) => (
     const activeCompositionId = getActiveCompositionId()
     const compositionById = useCompositionsStore.getState().compositionById
     const linkedGroupMap = new Map<string, string>()
+    const duplicatedItemIdByOriginalId = new Map<string, string>()
 
     for (let i = 0; i < itemIds.length; i++) {
       const original = itemsMap.get(itemIds[i]!)
@@ -353,13 +358,27 @@ export const useItemsStore = create<ItemsState & ItemsActions>()((set, get) => (
       } as TimelineItem
 
       newItems.push(normalizeFrameFields(duplicate))
+      duplicatedItemIdByOriginalId.set(original.id, duplicate.id)
     }
 
+    const remappedItems = newItems.map((item) => {
+      const originalParentId = item.transformParent?.parentItemId
+      const duplicatedParentId = originalParentId
+        ? duplicatedItemIdByOriginalId.get(originalParentId)
+        : undefined
+      return duplicatedParentId
+        ? ({
+            ...item,
+            transformParent: { ...item.transformParent, parentItemId: duplicatedParentId },
+          } as TimelineItem)
+        : item
+    })
+
     set((state) => {
-      const nextItems = [...state.items, ...newItems]
+      const nextItems = [...state.items, ...remappedItems]
       return withItemIndexes(nextItems, state)
     })
-    return newItems
+    return remappedItems
   },
 
   // Trim item start
@@ -572,9 +591,14 @@ export const useItemsStore = create<ItemsState & ItemsActions>()((set, get) => (
         // playback stays on the smooth forward-through-conform path across
         // the cut (same as forward-split clips reuse one source). Track each
         // half's offset into the conform so the runtime reads the right slice.
-        const parentConformOffset = item.reverseConformLocalStart ?? 0
-        leftItem.reverseConformLocalStart = parentConformOffset
-        rightItem.reverseConformLocalStart = parentConformOffset + leftDuration
+        if (item.reverseConformPreviewIsSourceLevel === true) {
+          leftItem.reverseConformLocalStart = undefined
+          rightItem.reverseConformLocalStart = undefined
+        } else {
+          const parentConformOffset = item.reverseConformLocalStart ?? 0
+          leftItem.reverseConformLocalStart = parentConformOffset
+          rightItem.reverseConformLocalStart = parentConformOffset + leftDuration
+        }
       } else {
         // Explicitly set sourceStart on left item so it has full explicit bounds.
         // Without this, the left item inherits undefined sourceStart from the original,
@@ -760,17 +784,22 @@ export const useItemsStore = create<ItemsState & ItemsActions>()((set, get) => (
     }),
 
   // Update transforms from map
-  _updateItemsTransformMap: (transformsMap) =>
+  _updateItemsTransformMap: (transformsMap, itemUpdates) =>
     set((state) => {
       const nextItems = state.items.map((item) => {
         const transform = transformsMap.get(item.id)
-        if (!transform) return item
-        if (!('transform' in item)) return item
+        const updates = itemUpdates?.get(item.id)
+        if (!transform && !updates) return item
 
-        return {
-          ...item,
+        const updatedItem = updates
+          ? normalizeFrameFields({ ...item, ...normalizeItemUpdates(updates) } as typeof item)
+          : item
+        if (!transform || !('transform' in item)) return updatedItem
+
+        return normalizeFrameFields({
+          ...updatedItem,
           transform: { ...item.transform, ...transform },
-        } as typeof item
+        } as typeof item)
       })
       return withItemIndexes(nextItems, state)
     }),

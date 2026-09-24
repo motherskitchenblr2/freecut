@@ -8,6 +8,7 @@ const playbackStateMocks = vi.hoisted(() => ({
     frame: 0,
     fps: 30,
     playing: false,
+    transportPlaybackRate: 1,
     resolvedVolume: 1,
     resolvedPitchShiftSemitones: 0,
     resolvedAudioEqStages: [] as (typeof DEFAULT_AUDIO_EQ_SETTINGS)[],
@@ -38,12 +39,15 @@ const previewGraphMocks = vi.hoisted(() => ({
 
 const soundTouchWorkletMocks = vi.hoisted(() => ({
   ensureSoundTouchPreviewWorkletLoaded: vi.fn(),
-  serializeAudioBufferForSoundTouchPreview: vi.fn(() => ({
+  prepareAudioBufferForSoundTouchPreview: vi.fn(async () => ({
     leftChannel: new Float32Array(0),
     rightChannel: new Float32Array(0),
     frameCount: 0,
     sampleRate: 48000,
   })),
+}))
+const workletNodeMocks = vi.hoisted(() => ({
+  messages: [] as unknown[],
 }))
 
 vi.mock('./hooks/use-audio-playback-state', () => ({
@@ -56,8 +60,8 @@ vi.mock('../utils/preview-audio-graph', () => ({
 }))
 vi.mock('../utils/soundtouch-preview-worklet', () => ({
   ensureSoundTouchPreviewWorkletLoaded: soundTouchWorkletMocks.ensureSoundTouchPreviewWorkletLoaded,
-  serializeAudioBufferForSoundTouchPreview:
-    soundTouchWorkletMocks.serializeAudioBufferForSoundTouchPreview,
+  prepareAudioBufferForSoundTouchPreview:
+    soundTouchWorkletMocks.prepareAudioBufferForSoundTouchPreview,
   SOUND_TOUCH_PREVIEW_PROCESSOR_NAME: 'soundtouch-preview-processor',
 }))
 vi.mock('@/runtime/composition-runtime/deps/stores', () => ({
@@ -88,10 +92,24 @@ describe('SoundTouchWorkletAudio', () => {
       frame: 0,
       fps: 30,
       playing: false,
+      transportPlaybackRate: 1,
       resolvedVolume: 1,
       resolvedPitchShiftSemitones: 0,
       resolvedAudioEqStages: [],
     }
+    workletNodeMocks.messages = []
+    vi.stubGlobal(
+      'AudioWorkletNode',
+      class {
+        port = {
+          postMessage: (message: unknown) => {
+            workletNodeMocks.messages.push(message)
+          },
+        }
+        connect() {}
+        disconnect() {}
+      },
+    )
   })
 
   it('does not render fallback while the worklet is still loading', async () => {
@@ -177,6 +195,75 @@ describe('SoundTouchWorkletAudio', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('fallback')).toBeInTheDocument()
+    })
+  })
+
+  it('runs reverse shuttle through SoundTouch with stable pitch and signed source direction', async () => {
+    playbackStateMocks.current = {
+      ...playbackStateMocks.current,
+      frame: 300,
+      playing: true,
+      transportPlaybackRate: -4,
+    }
+    soundTouchWorkletMocks.ensureSoundTouchPreviewWorkletLoaded.mockResolvedValue(true)
+
+    render(
+      <SoundTouchWorkletAudio
+        audioBuffer={makeAudioBuffer(12)}
+        itemId="nested-audio-1"
+        durationInFrames={600}
+        playbackRate={1}
+      />,
+    )
+
+    await waitFor(() => {
+      expect(workletNodeMocks.messages).toContainEqual({
+        type: 'set-tempo',
+        tempo: 4,
+      })
+      expect(workletNodeMocks.messages).toContainEqual({
+        type: 'seek',
+        frame: 480000,
+        direction: -1,
+      })
+      expect(workletNodeMocks.messages).toContainEqual({
+        type: 'set-pitch',
+        pitch: 1,
+      })
+      expect(workletNodeMocks.messages).toContainEqual({
+        type: 'set-playing',
+        playing: true,
+      })
+    })
+  })
+
+  it('reads an authored reversed clip backwards without reversing its buffer on the UI thread', async () => {
+    playbackStateMocks.current = {
+      ...playbackStateMocks.current,
+      frame: 90,
+      playing: true,
+      transportPlaybackRate: 1,
+    }
+    soundTouchWorkletMocks.ensureSoundTouchPreviewWorkletLoaded.mockResolvedValue(true)
+
+    render(
+      <SoundTouchWorkletAudio
+        audioBuffer={makeAudioBuffer(12)}
+        itemId="reversed-audio-1"
+        durationInFrames={360}
+        playbackRate={1}
+        isReversed
+        reverseSourceEnd={360}
+      />,
+    )
+
+    await waitFor(() => {
+      expect(workletNodeMocks.messages).toContainEqual(
+        expect.objectContaining({
+          type: 'seek',
+          direction: -1,
+        }),
+      )
     })
   })
 })

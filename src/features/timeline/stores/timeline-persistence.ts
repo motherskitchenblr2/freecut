@@ -1,8 +1,20 @@
 import type { LoadTimelineOptions } from '../types'
-import type { ItemKeyframes } from '@/types/keyframe'
-import type { AudioItem, CompositionItem, TimelineItem, TimelineTrack } from '@/types/timeline'
+import {
+  cloneVectorKeyframe,
+  getDirectPropertyLinks,
+  getPropertyExpressions,
+  type ItemKeyframes,
+} from '@/types/keyframe'
+import type {
+  AudioItem,
+  CompositionItem,
+  ProjectMarker,
+  TimelineItem,
+  TimelineTrack,
+} from '@/types/timeline'
+import type { AudioEqSettings } from '@/types/audio'
 import type { Transition } from '@/types/transition'
-import type { ProjectTimeline, Project } from '@/types/project'
+import type { CompositionEditorKind, ProjectTimeline, Project } from '@/types/project'
 
 import { createLogger, createOperationId } from '@/shared/logging/logger'
 import { usePreviewBridgeStore } from '@/shared/state/preview-bridge'
@@ -24,9 +36,12 @@ import { useTransitionsStore } from './transitions-store'
 import { useKeyframesStore } from './keyframes-store'
 import { useMarkersStore } from './markers-store'
 import { useTimelineSettingsStore } from './timeline-settings-store'
-import { useTimelineCommandStore } from './timeline-command-store'
-import { useCompositionsStore } from './compositions-store'
-import { useCompositionNavigationStore } from './composition-navigation-store'
+import { ROOT_HISTORY_CONTEXT, useTimelineCommandStore } from './timeline-command-store'
+import { useCompositionsStore, type SubComposition } from './compositions-store'
+import {
+  getActiveTabId,
+  useCompositionNavigationStore,
+} from './composition-navigation-store'
 import { useSequencesStore } from './sequences-store'
 import { getProject, updateProject, saveProjectThumbnail } from '@/infrastructure/storage'
 import {
@@ -51,6 +66,12 @@ import {
 } from '@/shared/utils/linked-media'
 import { getEffectiveTimelineMaxFrame, sanitizeInOutPoints } from '../utils/in-out-points'
 import { reverseConformService } from '../services/reverse-conform-service'
+import {
+  getCurrentTimelineSnapshot,
+  getEffectiveCompositions,
+  getRootTimelineSnapshot,
+  type TimelineSnapshotLike,
+} from './actions/shared'
 
 const logger = createLogger('TimelineStore')
 
@@ -692,9 +713,89 @@ async function repairLegacyProjectAvLayouts(
   }
 }
 
+interface TimelinePersistenceSnapshot {
+  rootTimeline: TimelineSnapshotLike
+  compositions: SubComposition[]
+  currentFrame: number
+  zoomLevel: number
+  scrollPosition: number
+  busAudioEq?: AudioEqSettings
+  masterBusDb: number
+  markers: ProjectMarker[]
+  inPoint: number | null
+  outPoint: number | null
+  isRootTimelineLive: boolean
+}
+
 /**
- * Save timeline to project in IndexedDB.
+ * Capture a Main-rooted project snapshot without navigating the live editor.
+ *
+ * Main may be live, stashed under a drilled-in composition, or held aside
+ * while a sequence/Motion composition is active. The active composition's
+ * domain stores can contain edits newer than its registry entry, so fold those
+ * live values into the serialized composition without mutating either store.
  */
+function captureTimelinePersistenceSnapshot(): TimelinePersistenceSnapshot {
+  const currentTimeline = getCurrentTimelineSnapshot()
+  const rootTimeline = getRootTimelineSnapshot(currentTimeline)
+  const navigation = useCompositionNavigationStore.getState()
+  const activeTabId = getActiveTabId(navigation.breadcrumbs)
+  const heldRoot =
+    activeTabId !== null
+      ? navigation.mainHolder
+      : navigation.activeCompositionId !== null
+        ? navigation.stashStack[0]
+        : null
+  if ((activeTabId !== null || navigation.activeCompositionId !== null) && !heldRoot) {
+    throw new Error('Cannot save while the Main timeline snapshot is unavailable')
+  }
+  const playback = usePlaybackStore.getState()
+  const markers = useMarkersStore.getState()
+  const settings = useTimelineSettingsStore.getState()
+  const zoom = useZoomStore.getState()
+  const rootView =
+    activeTabId !== null
+      ? useSequencesStore.getState().getSequenceView(ROOT_HISTORY_CONTEXT)
+      : undefined
+  const activeCompositionId = navigation.activeCompositionId
+  const compositions = getEffectiveCompositions(currentTimeline).map((composition) => {
+    if (composition.id !== activeCompositionId) return composition
+
+    const contentEnd = currentTimeline.items.reduce(
+      (maximum, item) => Math.max(maximum, item.from + item.durationInFrames),
+      0,
+    )
+    const durationInFrames =
+      composition.editorKind === 'composite-2d'
+        ? Math.max(1, composition.durationInFrames)
+        : contentEnd
+
+    return {
+      ...composition,
+      durationInFrames,
+      busAudioEq: playback.busAudioEq,
+      markers: markers.markers,
+      inPoint: markers.inPoint,
+      outPoint: markers.outPoint,
+    }
+  })
+
+  return {
+    rootTimeline,
+    compositions,
+    currentFrame: heldRoot ? heldRoot.currentFrame : playback.currentFrame,
+    zoomLevel: heldRoot?.zoomLevel ?? rootView?.zoomLevel ?? zoom.level,
+    scrollPosition:
+      heldRoot?.scrollPosition ?? rootView?.scrollPosition ?? settings.scrollPosition,
+    busAudioEq: heldRoot ? heldRoot.busAudioEq : playback.busAudioEq,
+    masterBusDb: playback.masterBusDb,
+    markers: heldRoot ? heldRoot.markers : markers.markers,
+    inPoint: heldRoot ? heldRoot.inPoint : markers.inPoint,
+    outPoint: heldRoot ? heldRoot.outPoint : markers.outPoint,
+    isRootTimelineLive: activeTabId === null && navigation.activeCompositionId === null,
+  }
+}
+
 /**
  * Serialize the current timeline domain stores into a {@link ProjectTimeline}.
  *
@@ -704,41 +805,41 @@ async function repairLegacyProjectAvLayouts(
  * timeline shape without the thumbnail-generation / storage-write side
  * effects. fps lives in project.metadata, not the timeline.
  */
-export function buildTimelineFromStores(): ProjectTimeline {
-  const itemsState = useItemsStore.getState()
-  const transitionsState = useTransitionsStore.getState()
-  const keyframesState = useKeyframesStore.getState()
-  const markersState = useMarkersStore.getState()
-  const settingsState = useTimelineSettingsStore.getState()
-  const currentFrame = usePlaybackStore.getState().currentFrame
-  const busAudioEq = usePlaybackStore.getState().busAudioEq
-  const masterBusDb = usePlaybackStore.getState().masterBusDb
-  const zoomLevel = useZoomStore.getState().level
-
+function buildTimelineFromPersistenceSnapshot(
+  snapshot: TimelinePersistenceSnapshot,
+): ProjectTimeline {
+  const rootTimeline = snapshot.rootTimeline
   const timeline: ProjectTimeline = {
-    tracks: itemsState.tracks as ProjectTimeline['tracks'],
-    items: itemsState.items as ProjectTimeline['items'],
-    ...(busAudioEq && { busAudioEq }),
-    masterBusDb,
-    currentFrame,
-    zoomLevel,
-    scrollPosition: settingsState.scrollPosition,
-    ...(markersState.inPoint !== null && { inPoint: markersState.inPoint }),
-    ...(markersState.outPoint !== null && { outPoint: markersState.outPoint }),
-    ...(markersState.markers.length > 0 && {
-      markers: markersState.markers.map((m) => ({
+    tracks: rootTimeline.tracks as ProjectTimeline['tracks'],
+    items: rootTimeline.items as ProjectTimeline['items'],
+    ...(snapshot.busAudioEq && { busAudioEq: snapshot.busAudioEq }),
+    masterBusDb: snapshot.masterBusDb,
+    currentFrame: snapshot.currentFrame,
+    zoomLevel: snapshot.zoomLevel,
+    scrollPosition: snapshot.scrollPosition,
+    ...(snapshot.inPoint !== null && { inPoint: snapshot.inPoint }),
+    ...(snapshot.outPoint !== null && { outPoint: snapshot.outPoint }),
+    ...(snapshot.markers.length > 0 && {
+      markers: snapshot.markers.map((m) => ({
         id: m.id,
         frame: m.frame,
         color: m.color,
         ...(m.label && { label: m.label }),
       })),
     }),
-    ...(transitionsState.transitions.length > 0 && {
-      transitions: transitionsState.transitions.map(cloneTransitionForProject),
+    ...(rootTimeline.transitions.length > 0 && {
+      transitions: rootTimeline.transitions.map(cloneTransitionForProject),
     }),
-    ...(keyframesState.keyframes.length > 0 && {
-      keyframes: keyframesState.keyframes.map((ik) => ({
+    ...(rootTimeline.keyframes.length > 0 && {
+      keyframes: rootTimeline.keyframes.map((ik) => ({
         itemId: ik.itemId,
+        ...(ik.animationVersion && { animationVersion: ik.animationVersion }),
+        ...(getDirectPropertyLinks(ik).length > 0 && {
+          propertyLinks: getDirectPropertyLinks(ik).map((link) => ({ ...link })),
+        }),
+        ...(getPropertyExpressions(ik).length > 0 && {
+          expressions: getPropertyExpressions(ik).map((expression) => ({ ...expression })),
+        }),
         properties: ik.properties.map((pk) => ({
           property: pk.property,
           keyframes: pk.keyframes.map((k) => ({
@@ -749,16 +850,26 @@ export function buildTimelineFromStores(): ProjectTimeline {
             ...(k.easingConfig && { easingConfig: k.easingConfig }),
           })),
         })),
+        ...(ik.vectorProperties?.length && {
+          vectorProperties: ik.vectorProperties.map((property) => ({
+            property: property.property,
+            keyframes: property.keyframes.map((keyframe) => cloneVectorKeyframe(keyframe)),
+          })),
+        }),
+        ...(ik.separatedVectorProperties?.length && {
+          separatedVectorProperties: [...ik.separatedVectorProperties],
+        }),
       })),
     }),
     // Sub-compositions (pre-comps)
     ...(() => {
-      const comps = useCompositionsStore.getState().compositions
+      const comps = snapshot.compositions
       if (comps.length === 0) return {}
       return {
         compositions: comps.map((c) => ({
           id: c.id,
           name: c.name,
+          editorKind: c.editorKind ?? 'sequence',
           items: c.items as ProjectTimeline['items'],
           tracks: c.tracks as ProjectTimeline['tracks'],
           ...(c.transitions?.length && {
@@ -772,6 +883,7 @@ export function buildTimelineFromStores(): ProjectTimeline {
           height: c.height,
           durationInFrames: c.durationInFrames,
           ...(c.backgroundColor && { backgroundColor: c.backgroundColor }),
+          compositionControls: c.compositionControls,
           ...(c.busAudioEq && { busAudioEq: c.busAudioEq }),
           ...(c.markers?.length && { markers: c.markers as ProjectTimeline['markers'] }),
           ...(c.inPoint != null && { inPoint: c.inPoint }),
@@ -782,10 +894,14 @@ export function buildTimelineFromStores(): ProjectTimeline {
     // Standalone timeline tabs (multi-timeline) — keep only ids that resolve to
     // an existing composition so tabs never dangle.
     ...(() => {
-      const compIds = new Set(useCompositionsStore.getState().compositions.map((c) => c.id))
+      const sequenceIds = new Set(
+        snapshot.compositions
+          .filter((composition) => composition.editorKind !== 'composite-2d')
+          .map((composition) => composition.id),
+      )
       const topLevelSequenceIds = useSequencesStore
         .getState()
-        .topLevelSequenceIds.filter((id) => compIds.has(id))
+        .topLevelSequenceIds.filter((id) => sequenceIds.has(id))
       return topLevelSequenceIds.length > 0 ? { topLevelSequenceIds } : {}
     })(),
   }
@@ -793,57 +909,31 @@ export function buildTimelineFromStores(): ProjectTimeline {
   return sanitizeTimelineEphemeralFields(timeline).timeline
 }
 
+export function buildTimelineFromStores(): ProjectTimeline {
+  return buildTimelineFromPersistenceSnapshot(captureTimelinePersistenceSnapshot())
+}
+
 export async function saveTimeline(projectId: string): Promise<void> {
   const opId = createOperationId()
   const event = logger.startEvent('saveTimeline', opId)
   event.set('projectId', projectId)
 
-  // Serialization reads Main from the live stores, so if the user is on a
-  // sequence tab (or drilled into a compound clip) we reset to Main to build the
-  // project, then restore their tab + drill-in path afterwards. The tab root
-  // (breadcrumbs[0]) is restored via switchToSequence; deeper levels via enter.
-  const navStore = useCompositionNavigationStore.getState()
-  const restoreTabId = navStore.breadcrumbs[0]?.compositionId ?? null
-  const drillPath = navStore.breadcrumbs.slice(1).map((breadcrumb) => ({
-    compositionId: breadcrumb.compositionId!,
-    label: breadcrumb.label,
-    entryItemId: breadcrumb.entryItemId,
-  }))
-  const needsRestore = restoreTabId !== null || drillPath.length > 0
-  // Preserve the playhead within the active tab: the reset + re-enter below would
-  // otherwise jump it on every autosave.
-  const savedCurrentFrame = usePlaybackStore.getState().currentFrame
-  if (needsRestore) {
-    navStore.resetToRoot()
-  }
+  // Saving must not navigate the live editor. A temporary Main swap is still
+  // observable by Motion's store subscribers and asynchronous preview renderer.
+  const persistenceSnapshot = captureTimelinePersistenceSnapshot()
+  const rootTimeline = persistenceSnapshot.rootTimeline
 
-  const restoreCompositionPath = () => {
-    if (restoreTabId !== null) {
-      useCompositionNavigationStore.getState().switchToSequence(restoreTabId)
-    }
-    for (const breadcrumb of drillPath) {
-      useCompositionNavigationStore
-        .getState()
-        .enterComposition(breadcrumb.compositionId, breadcrumb.label, breadcrumb.entryItemId)
-    }
-    usePlaybackStore.getState().setCurrentFrame(savedCurrentFrame)
+  // Keep the existing thumbnail/event code rooted in Main's captured data.
+  const itemsState = {
+    items: rootTimeline.items,
+    tracks: rootTimeline.tracks,
   }
+  const transitionsState = { transitions: rootTimeline.transitions }
+  const keyframesState = { keyframes: rootTimeline.keyframes }
+  const currentFrame = persistenceSnapshot.currentFrame
 
-  // Read directly from domain stores (for the event log + thumbnail; the
-  // timeline shape itself comes from buildTimelineFromStores()).
-  const itemsState = useItemsStore.getState()
-  const transitionsState = useTransitionsStore.getState()
-  const keyframesState = useKeyframesStore.getState()
-  const currentFrame = usePlaybackStore.getState().currentFrame
-
-  // Build the (Main-rooted) timeline and restore the user's tab/drill context
-  // NOW, before any await — keeping the temporary swap to Main synchronous so
-  // autosave never visibly parks the editor on Main across the async storage +
-  // thumbnail work below.
-  const sanitizedTimeline = buildTimelineFromStores()
-  if (needsRestore) {
-    restoreCompositionPath()
-  }
+  // Serialize the same immutable snapshot used by events and thumbnails.
+  const sanitizedTimeline = buildTimelineFromPersistenceSnapshot(persistenceSnapshot)
 
   event.merge({
     itemCount: itemsState.items.length,
@@ -893,9 +983,11 @@ export async function saveTimeline(projectId: string): Promise<void> {
 
         let thumbnailBlob: Blob | null = null
 
-        // Fast path: capture from existing preview renderer (avoids full re-init)
+        // Fast path is valid only while Main owns the live preview. In Motion,
+        // render Main from its held snapshot instead of saving the Motion canvas
+        // as the project cover.
         const captureCanvasSource = usePreviewBridgeStore.getState().captureCanvasSource
-        if (captureCanvasSource) {
+        if (captureCanvasSource && persistenceSnapshot.isRootTimelineLive) {
           try {
             const sourceCanvas = await captureCanvasSource()
             if (sourceCanvas) {
@@ -992,6 +1084,12 @@ export async function saveTimeline(projectId: string): Promise<void> {
  * migrating from storage; it then runs media validation on top.
  */
 export async function hydrateTimelineStoresFromProject(project: Project): Promise<void> {
+  // Unwind the outgoing runtime context before replacing any live domain
+  // stores. If a Motion composition is active and root items are loaded first,
+  // resetToRoot() mistakes those freshly loaded root items for composition
+  // contents and saves them into the active composition on refresh.
+  useCompositionNavigationStore.getState().resetToRoot()
+
   // Swap in this project's saved track heights before any setTracks call, since
   // that is what resolves each track's height. Heights are a local view
   // preference and never come out of the project file.
@@ -1045,6 +1143,9 @@ export async function hydrateTimelineStoresFromProject(project: Project): Promis
         t.compositions.map(async (c) => ({
           id: c.id,
           name: c.name,
+          editorKind: (c.editorKind === 'composite-2d'
+            ? 'composite-2d'
+            : 'sequence') as CompositionEditorKind,
           items: await reverseConformService.hydrateItems(c.items as TimelineItem[]),
           tracks: c.tracks as TimelineTrack[],
           transitions: (c.transitions ?? []) as Transition[],
@@ -1054,6 +1155,7 @@ export async function hydrateTimelineStoresFromProject(project: Project): Promis
           height: c.height,
           durationInFrames: c.durationInFrames,
           ...(c.backgroundColor && { backgroundColor: c.backgroundColor }),
+          compositionControls: c.compositionControls,
           ...(c.busAudioEq && { busAudioEq: c.busAudioEq }),
           markers: c.markers ?? [],
           inPoint: c.inPoint ?? null,
@@ -1067,18 +1169,18 @@ export async function hydrateTimelineStoresFromProject(project: Project): Promis
 
     // Restore standalone timeline tabs (multi-timeline). Filter to ids that
     // resolve to a hydrated composition so tabs never dangle.
-    const hydratedCompositionIds = new Set(
-      useCompositionsStore.getState().compositions.map((c) => c.id),
+    const hydratedSequenceIds = new Set(
+      useCompositionsStore
+        .getState()
+        .compositions.filter((composition) => composition.editorKind === 'sequence')
+        .map((c) => c.id),
     )
     useSequencesStore.getState().reset()
     useSequencesStore
       .getState()
       .setTopLevelSequenceIds(
-        (t.topLevelSequenceIds ?? []).filter((id) => hydratedCompositionIds.has(id)),
+        (t.topLevelSequenceIds ?? []).filter((id) => hydratedSequenceIds.has(id)),
       )
-
-    // Reset composition navigation to root on load
-    useCompositionNavigationStore.getState().resetToRoot()
 
     // Restore zoom and playback
     if (t.zoomLevel !== undefined) {
@@ -1104,7 +1206,6 @@ export async function hydrateTimelineStoresFromProject(project: Project): Promis
     useMarkersStore.getState().setOutPoint(null)
     useCompositionsStore.getState().setCompositions([])
     useSequencesStore.getState().reset()
-    useCompositionNavigationStore.getState().resetToRoot()
     useTimelineSettingsStore.getState().setScrollPosition(0)
     useZoomStore.getState().setZoomLevel(1)
     usePlaybackStore.getState().setCurrentFrame(0)
@@ -1122,13 +1223,50 @@ export async function hydrateTimelineStoresFromProject(project: Project): Promis
   useTimelineCommandStore.getState().clearHistory()
 }
 
-export async function loadTimeline(
+const inFlightTimelineLoads = new Map<string, Promise<void>>()
+let timelineLoadQueueTail: Promise<void> | null = null
+
+function getTimelineLoadKey(projectId: string, options: LoadTimelineOptions): string {
+  return JSON.stringify([projectId, options.allowProjectUpgrade === true])
+}
+
+export function loadTimeline(
   projectId: string,
   options: LoadTimelineOptions = {},
 ): Promise<void> {
-  // Mark loading started - used to coordinate initial player sync
-  useTimelineSettingsStore.getState().setTimelineLoading(true)
+  const loadKey = getTimelineLoadKey(projectId, options)
+  const inFlightLoad = inFlightTimelineLoads.get(loadKey)
+  if (inFlightLoad) return inFlightLoad
 
+  // Keep all project hydration serialized because every load writes into the
+  // same live timeline stores. An earlier slow read can no longer finish after
+  // and overwrite a later distinct project request.
+  useTimelineSettingsStore.getState().setTimelineLoading(true)
+  const queueStart = timelineLoadQueueTail
+    ? timelineLoadQueueTail.catch(() => undefined)
+    : Promise.resolve()
+
+  let pendingLoad: Promise<void>
+  pendingLoad = queueStart
+    .then(() => loadTimelineOnce(projectId, options))
+    .finally(() => {
+      if (inFlightTimelineLoads.get(loadKey) === pendingLoad) {
+        inFlightTimelineLoads.delete(loadKey)
+      }
+      if (timelineLoadQueueTail === pendingLoad) {
+        timelineLoadQueueTail = null
+        useTimelineSettingsStore.getState().setTimelineLoading(false)
+      }
+    })
+  inFlightTimelineLoads.set(loadKey, pendingLoad)
+  timelineLoadQueueTail = pendingLoad
+  return pendingLoad
+}
+
+async function loadTimelineOnce(
+  projectId: string,
+  options: LoadTimelineOptions = {},
+): Promise<void> {
   try {
     const rawProject = await getProject(projectId)
     if (!rawProject) {
@@ -1196,13 +1334,8 @@ export async function loadTimeline(
       useMediaLibraryStore.getState().closeOrphanedClipsDialog()
       useMediaLibraryStore.getState().setOrphanedClips([])
     }
-
-    // Mark loading complete - signals player sync can proceed
-    useTimelineSettingsStore.getState().setTimelineLoading(false)
   } catch (error) {
     logger.error('Failed to load timeline:', error)
-    // Still mark loading complete on error so UI isn't stuck
-    useTimelineSettingsStore.getState().setTimelineLoading(false)
     throw error
   }
 }
